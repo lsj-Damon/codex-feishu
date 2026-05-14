@@ -1,0 +1,40 @@
+{
+  "name": "feishu-local-coding-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.11",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate": "npm.cmd run build && node dist/scripts/migrate.js",
+    "diag:feishu-ws": "npm.cmd run build && node dist/scripts/diag-feishu-ws.js",
+    "diag:feishu-ws:freecode": "bun run src/scripts/diag-feishu-ws-freecode.ts",
+    "cleanup:db": "node --experimental-strip-types scripts/cleanup-db.ts",
+    "backup:db": "powershell.exe -ExecutionPolicy Bypass -File scripts/backup-db.ps1",
+    "smoke:codex-control": "npm.cmd run build && node dist/scripts/codex-control-smoke.js",
+    "smoke:codex-real": "npm.cmd run build && node dist/scripts/codex-real-smoke.js",
+    "smoke:codex-session-manager": "npm.cmd run build && node dist/scripts/codex-session-manager-smoke.js",
+    "smoke:codex-streaming": "npm.cmd run build && node dist/scripts/codex-streaming-smoke.js",
+    "smoke:codex-worker": "npm.cmd run build && node dist/scripts/codex-worker-smoke.js",
+    "smoke:image-mvp": "npm.cmd run build && node dist/scripts/image-mvp-smoke.js",
+    "smoke:m2": "npm.cmd run build && node dist/scripts/m2-smoke.js",
+    "smoke:m3": "npm.cmd run build && node dist/scripts/m3-smoke.js",
+    "smoke:m4": "npm.cmd run build && node dist/scripts/m4-smoke.js",
+    "dev:gateway": "npm.cmd run build && node dist/apps/bot-gateway/main.js",
+    "dev:worker": "npm.cmd run build && node dist/apps/assistant-worker/main.js",
+    "start:gateway": "node dist/apps/bot-gateway/main.js",
+    "start:worker": "node dist/apps/assistant-worker/main.js"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "latest",
+    "openai": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}

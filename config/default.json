@@ -1,0 +1,44 @@
+{
+  "feishu": {
+    "connectionMode": "websocket",
+    "domain": "feishu",
+    "bindHost": "127.0.0.1",
+    "bindPort": 39876,
+    "callbackPath": "/feishu/events"
+  },
+  "triggerPolicy": {
+    "allowGroups": false,
+    "allowedChatIds": [],
+    "allowedUserIds": []
+  },
+  "openai": {
+    "model": "gpt-5.4-mini"
+  },
+  "codex": {
+    "workspaceRoot": "D:\\Develop\\workspace",
+    "cliPath": "codex",
+    "execTimeoutMs": 600000,
+    "maxProgressMessageIntervalMs": 3000,
+    "maxOutputChars": 4000
+  },
+  "worker": {
+    "pollIntervalMs": 1000,
+    "leaseDurationMs": 120000,
+    "leaseRenewIntervalMs": 20000,
+    "maxContextMessages": 10,
+    "maxMessageChars": 1800,
+    "maxReplyChars": 900,
+    "summaryTriggerMessageCount": 8,
+    "summaryRefreshInterval": 4,
+    "maxAttempts": 4,
+    "retryBaseMs": 3000,
+    "retryMaxDelayMs": 300000
+  },
+  "maintenance": {
+    "backupKeepCount": 5,
+    "rawEventRetentionDays": 7,
+    "deliveryRetentionDays": 14,
+    "jobRetentionDays": 30,
+    "logRetentionDays": 14
+  }
+}
