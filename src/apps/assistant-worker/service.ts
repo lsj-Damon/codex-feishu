@@ -271,6 +271,14 @@ export class AssistantWorkerService {
               this.config.codex.maxProgressMessageIntervalMs,
             onWarning: (warning) => {
               jobLogger.warn(warning);
+            },
+            onProgressDelivered: (info) => {
+              jobLogger.info('progress delivered to feishu', {
+                run_id: info.runId,
+                event_type: info.eventType,
+                feishu_message_id: info.feishuMessageId,
+                text_preview: info.text.slice(0, 120)
+              });
             }
           }),
           this.config.codex.execTimeoutMs,
@@ -391,6 +399,19 @@ export class AssistantWorkerService {
           classification.message,
           now
         );
+        if (codexCompletion === null && currentSessionId) {
+          this.codexSessionManager.completeRun(
+            this.findLatestRunIdForJob(job.id),
+            {
+              status: 'failed',
+              exitCode: null,
+              jsonlPath: null,
+              stderrPath: null,
+              finalReplyText: classification.message
+            }
+          );
+          this.codexSessionManager.markSessionIdle(currentSessionId);
+        }
         this.state.lastErrorAt = now;
         this.jobAttempts.finishAttempt({
           attemptId,
@@ -410,8 +431,8 @@ export class AssistantWorkerService {
       this.writeHealth('running');
       return true;
     } finally {
-      if (currentSessionId && stage === 'generation' && codexCompletion === null) {
-        this.codexSessionManager.markSessionIdle(currentSessionId);
+      if (currentSessionId && codexCompletion && codexCompletion.exitCode === 0) {
+        this.codexSessionManager.markSessionActive(currentSessionId);
       }
       stopLeaseRenewal();
     }
@@ -728,6 +749,24 @@ export class AssistantWorkerService {
     }
 
     return null;
+  }
+
+  private findLatestRunIdForJob(jobId: number): number {
+    const row = this.database
+      .prepare(`
+        SELECT id
+        FROM codex_runs
+        WHERE job_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .get(jobId) as { id?: number } | undefined;
+
+    if (!row?.id) {
+      throw new Error(`Missing codex run for job ${jobId}`);
+    }
+
+    return Number(row.id);
   }
 }
 

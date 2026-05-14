@@ -6,3 +6,9 @@ dist/
 .DS_Store
 *.log
 .env
+.claude-flow/
+.claude/settings.json
+.claude/memory.db
+.swarm/
+.mcp.json
+ruvector.db

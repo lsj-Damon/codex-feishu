@@ -139,10 +139,37 @@ function createCodexRunHandle(
   stdoutRl.on('close', () => {
     markStreamDone();
   });
+  stdoutRl.on('error', (error) => {
+    writeFileSync(stderrPath, `stdout-readline:${error.message}\n`, {
+      encoding: 'utf8',
+      flag: 'a'
+    });
+    markStreamDone();
+  });
 
   const stderrRl = createInterface({ input: child.stderr });
   stderrRl.on('line', (line) => {
     writeFileSync(stderrPath, `${line}\n`, {
+      encoding: 'utf8',
+      flag: 'a'
+    });
+  });
+  stderrRl.on('error', (error) => {
+    writeFileSync(stderrPath, `stderr-readline:${error.message}\n`, {
+      encoding: 'utf8',
+      flag: 'a'
+    });
+  });
+
+  child.stdout.on('error', (error) => {
+    writeFileSync(stderrPath, `stdout-stream:${error.message}\n`, {
+      encoding: 'utf8',
+      flag: 'a'
+    });
+    markStreamDone();
+  });
+  child.stderr.on('error', (error) => {
+    writeFileSync(stderrPath, `stderr-stream:${error.message}\n`, {
       encoding: 'utf8',
       flag: 'a'
     });
@@ -159,6 +186,8 @@ function createCodexRunHandle(
       encoding: 'utf8',
       flag: 'a'
     });
+    exitCode = 1;
+    markStreamDone();
   });
 
   return {

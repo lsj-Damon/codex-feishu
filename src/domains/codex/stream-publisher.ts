@@ -19,6 +19,12 @@ export async function consumeCodexRunStream(input: {
   sink: CodexProgressSink;
   progressIntervalMs: number;
   onWarning?: (message: string) => void;
+  onProgressDelivered?: (info: {
+    runId: number;
+    eventType: string;
+    text: string;
+    feishuMessageId: string | null;
+  }) => void;
 }): Promise<CodexRunCompletion> {
   const progressBuffer = new CodexProgressBuffer(input.progressIntervalMs);
   let sequenceNo = 1;
@@ -40,6 +46,12 @@ export async function consumeCodexRunStream(input: {
           try {
             const feishuMessageId = await input.sink.sendProgress(item.text);
             input.sessionManager.markStreamEventPushed(record.id, feishuMessageId);
+            input.onProgressDelivered?.({
+              runId: input.runId,
+              eventType: item.eventType,
+              text: item.text,
+              feishuMessageId
+            });
           } catch (error) {
             input.onWarning?.(
               `progress delivery failed: ${
