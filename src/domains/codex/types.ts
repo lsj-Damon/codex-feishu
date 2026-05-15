@@ -1,3 +1,5 @@
+import type { CodexProgressCategory } from '../../core/types/domain.js';
+
 export interface CodexRunInput {
   workspaceRoot: string;
   promptText: string;
@@ -37,4 +39,7 @@ export interface CodexTranslatedEvent {
   kind: 'progress' | 'final';
   text: string;
   eventType: string;
+  category: CodexProgressCategory;
+  itemType?: string;
+  status?: string;
 }

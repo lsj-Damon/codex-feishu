@@ -1,6 +1,10 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-import type { CodexRunRecord, CodexRunStatus } from '../../core/types/domain.js';
+import type {
+  CodexJobRunSummary,
+  CodexRunRecord,
+  CodexRunStatus
+} from '../../core/types/domain.js';
 
 interface CreateCodexRunInput {
   sessionId: number;
@@ -59,6 +63,99 @@ export class CodexRunRepository {
       `)
       .get(sessionId);
     return row ? mapCodexRunRow(row as Record<string, unknown>) : null;
+  }
+
+  public getActiveByJobId(jobId: number): CodexRunRecord | null {
+    const row = this.database
+      .prepare(`
+        SELECT *
+        FROM codex_runs
+        WHERE job_id = ?
+          AND status IN ('queued', 'running')
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .get(jobId);
+    return row ? mapCodexRunRow(row as Record<string, unknown>) : null;
+  }
+
+  public getLatestAttemptByJobId(jobId: number): CodexRunRecord | null {
+    const row = this.database
+      .prepare(`
+        SELECT *
+        FROM codex_runs
+        WHERE job_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .get(jobId);
+    return row ? mapCodexRunRow(row as Record<string, unknown>) : null;
+  }
+
+  public getLatestFinishedByJobId(jobId: number): CodexRunRecord | null {
+    const row = this.database
+      .prepare(`
+        SELECT *
+        FROM codex_runs
+        WHERE job_id = ?
+          AND status NOT IN ('queued', 'running')
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .get(jobId);
+    return row ? mapCodexRunRow(row as Record<string, unknown>) : null;
+  }
+
+  public getLatestSuccessfulByJobId(jobId: number): CodexRunRecord | null {
+    const row = this.database
+      .prepare(`
+        SELECT *
+        FROM codex_runs
+        WHERE job_id = ?
+          AND status = 'succeeded'
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .get(jobId);
+    return row ? mapCodexRunRow(row as Record<string, unknown>) : null;
+  }
+
+  public listByJobId(jobId: number): CodexRunRecord[] {
+    const rows = this.database
+      .prepare(`
+        SELECT *
+        FROM codex_runs
+        WHERE job_id = ?
+        ORDER BY id DESC
+      `)
+      .all(jobId) as Array<Record<string, unknown>>;
+    return rows.map(mapCodexRunRow);
+  }
+
+  public getJobHistorySummary(jobId: number): CodexJobRunSummary {
+    const aggregate = this.database
+      .prepare(`
+        SELECT
+          COUNT(*) AS attempt_count,
+          SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_attempt_count
+        FROM codex_runs
+        WHERE job_id = ?
+      `)
+      .get(jobId) as
+      | {
+          attempt_count?: number;
+          failed_attempt_count?: number;
+        }
+      | undefined;
+
+    return {
+      activeRun: this.getActiveByJobId(jobId),
+      latestAttemptRun: this.getLatestAttemptByJobId(jobId),
+      latestFinishedRun: this.getLatestFinishedByJobId(jobId),
+      latestSuccessfulRun: this.getLatestSuccessfulByJobId(jobId),
+      attemptCount: Number(aggregate?.attempt_count ?? 0),
+      failedAttemptCount: Number(aggregate?.failed_attempt_count ?? 0)
+    };
   }
 
   public updateStatus(id: number, status: CodexRunStatus, finishedAt?: string | null): void {

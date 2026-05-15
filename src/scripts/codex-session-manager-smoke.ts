@@ -62,8 +62,18 @@ async function main(): Promise<void> {
   `).get(sessionA.id) as { status: string };
   assert.equal(previousSession.status, 'idle');
 
+  manager.markSessionBroken(sessionB.id);
+  const replacement = manager.ensureSessionForProject({
+    conversationId,
+    workspaceRoot: config.codex.workspaceRoot,
+    projectName: 'beta',
+    projectPath: path.join(config.codex.workspaceRoot, 'beta')
+  });
+  assert.notEqual(replacement.id, sessionB.id);
+  assert.equal(replacement.status, 'active');
+
   const run = manager.createRun({
-    sessionId: sessionB.id,
+    sessionId: replacement.id,
     jobId: seedJob(database, conversationId),
     userMessageId: seedUserMessage(database, conversationId),
     promptText: 'check current project'

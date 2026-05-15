@@ -2,14 +2,17 @@ import assert from 'node:assert/strict';
 import { mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 
-import { FakeCodexCliClient } from '../domains/codex/fake-client.js';
-import { CodexSessionManager } from '../domains/codex/session-manager.js';
-import { consumeCodexRunStream, createProgressMessageEvent } from '../domains/codex/stream-publisher.js';
 import type { AppConfig } from '../core/config/index.js';
 import { ensureRuntimeDirectories } from '../core/config/index.js';
 import { openDatabase } from '../core/db/database.js';
 import { runMigrations } from '../core/db/migrations.js';
 import { AppLogger } from '../core/logger/logger.js';
+import { FakeCodexCliClient } from '../domains/codex/fake-client.js';
+import { CodexSessionManager } from '../domains/codex/session-manager.js';
+import {
+  consumeCodexRunStream,
+  createProgressMessageEvent
+} from '../domains/codex/stream-publisher.js';
 
 async function main(): Promise<void> {
   const runtimeRoot = path.join(process.cwd(), '.runtime', 'codex-streaming-smoke');
@@ -18,7 +21,10 @@ async function main(): Promise<void> {
 
   const config = createTestConfig(runtimeRoot);
   ensureRuntimeDirectories(config);
-  const logger = new AppLogger('codex-streaming-smoke', path.join(config.paths.logsDir, 'worker.log'));
+  const logger = new AppLogger(
+    'codex-streaming-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
   const database = openDatabase(config.paths.dbFile, logger);
   runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
 
@@ -31,6 +37,7 @@ async function main(): Promise<void> {
     projectPath: path.join(config.codex.workspaceRoot, 'feishu-server')
   });
   manager.markSessionBusy(session.id);
+
   const run = manager.createRun({
     sessionId: session.id,
     jobId: seedJob(database, conversationId),
@@ -45,19 +52,19 @@ async function main(): Promise<void> {
       events: [
         { type: 'thread.started', thread_id: 'thread-stream-1' },
         { type: 'turn.started' },
-        createProgressMessageEvent('正在读取项目结构'),
-        createProgressMessageEvent('正在运行验证命令'),
+        createProgressMessageEvent('Scanning project structure'),
+        createProgressMessageEvent('Running validation command'),
         {
           type: 'item.completed',
           item: {
             type: 'agent_message',
-            text: '已完成 fake streaming 验证。'
+            text: 'Streaming smoke completed.'
           }
         }
       ],
       completion: {
         exitCode: 0,
-        finalMessageText: '已完成 fake streaming 验证。',
+        finalMessageText: 'Streaming smoke completed.',
         jsonlPath: path.join(runtimeRoot, 'run.jsonl'),
         stderrPath: path.join(runtimeRoot, 'run.stderr')
       }
@@ -66,6 +73,7 @@ async function main(): Promise<void> {
 
   const progressMessages: string[] = [];
   const finalMessages: string[] = [];
+  const deliveredCategories: string[] = [];
   const handle = await fakeClient.runNewSession({
     workspaceRoot: config.codex.workspaceRoot,
     promptText: run.promptText,
@@ -87,7 +95,10 @@ async function main(): Promise<void> {
         return `final-${finalMessages.length}`;
       }
     },
-    progressIntervalMs: 0
+    progressIntervalMs: 0,
+    onProgressDelivered: (info) => {
+      deliveredCategories.push(info.category);
+    }
   });
 
   manager.setCodexSessionId(session.id, completion.codexSessionId);
@@ -101,11 +112,14 @@ async function main(): Promise<void> {
   manager.markSessionActive(session.id);
 
   assert.equal(progressMessages.length >= 2, true);
-  assert.equal(finalMessages[0], '已完成 fake streaming 验证。');
+  assert.equal(deliveredCategories.includes('session'), true);
   assert.equal(
-    manager.listRunEvents(run.id).length,
-    5
+    deliveredCategories.includes('turn') ||
+      deliveredCategories.includes('status'),
+    true
   );
+  assert.equal(finalMessages[0], 'Streaming smoke completed.');
+  assert.equal(manager.listRunEvents(run.id).length, 5);
 
   const storedRun = database.prepare(`
     SELECT status, final_reply_text
@@ -113,7 +127,7 @@ async function main(): Promise<void> {
     WHERE id = ?
   `).get(run.id) as { status: string; final_reply_text: string };
   assert.equal(storedRun.status, 'succeeded');
-  assert.equal(storedRun.final_reply_text, '已完成 fake streaming 验证。');
+  assert.equal(storedRun.final_reply_text, 'Streaming smoke completed.');
 
   database.close();
   console.log('Codex streaming smoke checks passed.');
@@ -129,11 +143,18 @@ function seedConversation(database: ReturnType<typeof openDatabase>): number {
   `).run('D:\\Develop\\workspace', now, now, now);
 
   return Number(
-    (database.prepare(`SELECT id FROM conversations WHERE conversation_key = 'chat-stream'`).get() as { id: number }).id
+    (
+      database
+        .prepare(`SELECT id FROM conversations WHERE conversation_key = 'chat-stream'`)
+        .get() as { id: number }
+    ).id
   );
 }
 
-function seedUserMessage(database: ReturnType<typeof openDatabase>, conversationId: number): number {
+function seedUserMessage(
+  database: ReturnType<typeof openDatabase>,
+  conversationId: number
+): number {
   const now = nowIso();
   database.prepare(`
     INSERT INTO messages (
@@ -144,11 +165,18 @@ function seedUserMessage(database: ReturnType<typeof openDatabase>, conversation
   `).run(conversationId, `msg-${Date.now()}`, now);
 
   return Number(
-    (database.prepare(`SELECT id FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1`).get(conversationId) as { id: number }).id
+    (
+      database
+        .prepare(`SELECT id FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1`)
+        .get(conversationId) as { id: number }
+    ).id
   );
 }
 
-function seedJob(database: ReturnType<typeof openDatabase>, conversationId: number): number {
+function seedJob(
+  database: ReturnType<typeof openDatabase>,
+  conversationId: number
+): number {
   const messageId = seedUserMessage(database, conversationId);
   const now = nowIso();
   database.prepare(`
@@ -160,7 +188,11 @@ function seedJob(database: ReturnType<typeof openDatabase>, conversationId: numb
   `).run(conversationId, messageId, now, now, now);
 
   return Number(
-    (database.prepare(`SELECT id FROM jobs WHERE conversation_id = ? ORDER BY id DESC LIMIT 1`).get(conversationId) as { id: number }).id
+    (
+      database
+        .prepare(`SELECT id FROM jobs WHERE conversation_id = ? ORDER BY id DESC LIMIT 1`)
+        .get(conversationId) as { id: number }
+    ).id
   );
 }
 

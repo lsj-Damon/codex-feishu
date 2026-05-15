@@ -11,6 +11,7 @@ import { HealthReporter } from '../core/health/reporter.js';
 import { AppLogger } from '../core/logger/logger.js';
 import { FakeCodexCliClient } from '../domains/codex/fake-client.js';
 import { createProgressMessageEvent } from '../domains/codex/stream-publisher.js';
+import { CodexSessionManager } from '../domains/codex/session-manager.js';
 
 async function main(): Promise<void> {
   const runtimeRoot = path.join(process.cwd(), '.runtime', 'codex-worker-smoke');
@@ -23,53 +24,68 @@ async function main(): Promise<void> {
 
   const config = createTestConfig(runtimeRoot, workspaceRoot);
   ensureRuntimeDirectories(config);
-  const logger = new AppLogger('codex-worker-smoke', path.join(config.paths.logsDir, 'worker.log'));
+  const logger = new AppLogger(
+    'codex-worker-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
   const database = openDatabase(config.paths.dbFile, logger);
   runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
 
-  const conversationId = seedConversation(database, workspaceRoot, 'alpha', projectPath);
+  const conversationId = seedConversation(
+    database,
+    workspaceRoot,
+    'alpha',
+    projectPath
+  );
   const fakeFeishu = new FakeFeishuMessageClient();
   const fakeCodex = new FakeCodexCliClient([
     {
-      sessionId: 'thread-worker-1',
+      sessionId: 'thread-broken-old',
+      events: [],
+      completion: {
+        exitCode: null,
+        finalMessageText: null,
+        jsonlPath: path.join(runtimeRoot, 'worker-run-1.jsonl'),
+        stderrPath: path.join(runtimeRoot, 'worker-run-1.stderr')
+      },
+      waitForCompletionError: new Error('resume failed: session not found')
+    },
+    {
+      sessionId: 'thread-worker-2',
       events: [
-        { type: 'thread.started', thread_id: 'thread-worker-1' },
+        { type: 'thread.started', thread_id: 'thread-worker-2' },
         { type: 'turn.started' },
-        createProgressMessageEvent('正在读取代码结构'),
-        createProgressMessageEvent('正在分析入口文件'),
+        createProgressMessageEvent('Scanning code structure'),
+        createProgressMessageEvent('Inspecting entry files'),
         {
           type: 'item.completed',
           item: {
             type: 'agent_message',
-            text: '已完成 Codex worker 路径验证。'
+            text: 'Codex worker path verified.'
           }
         }
       ],
       completion: {
         exitCode: 0,
-        finalMessageText: '已完成 Codex worker 路径验证。',
-        jsonlPath: path.join(runtimeRoot, 'worker-run.jsonl'),
-        stderrPath: path.join(runtimeRoot, 'worker-run.stderr')
+        finalMessageText: 'Codex worker path verified.',
+        jsonlPath: path.join(runtimeRoot, 'worker-run-2.jsonl'),
+        stderrPath: path.join(runtimeRoot, 'worker-run-2.stderr')
       }
     }
   ]);
 
+  const seededSessionId = seedBrokenResumeSession(
+    database,
+    conversationId,
+    projectPath
+  );
+  const triggerMessageId = seedUserMessage(database, conversationId, 'Analyze this project');
   const createdAt = nowIso();
   database.prepare(`
-    INSERT INTO messages (
-      platform, conversation_id, platform_message_id, reply_to_message_id,
-      role, sender_open_id, content_text, content_json, token_input, token_output,
-      model, response_id, status, created_at
-    ) VALUES ('feishu', ?, 'msg-codex-worker', NULL, 'user', 'user-1', 'Analyze this project', '{}', NULL, NULL, NULL, NULL, 'received', ?)
-  `).run(conversationId, createdAt);
-  const triggerMessageId = Number(
-    (database.prepare(`SELECT id FROM messages WHERE platform_message_id = 'msg-codex-worker'`).get() as { id: number }).id
-  );
-  database.prepare(`
     UPDATE conversations
-    SET last_user_message_id = ?, message_count = 1, last_activity_at = ?, updated_at = ?
+    SET last_user_message_id = ?, message_count = 1, last_activity_at = ?, updated_at = ?, active_session_id = ?
     WHERE id = ?
-  `).run(triggerMessageId, createdAt, createdAt, conversationId);
+  `).run(triggerMessageId, createdAt, createdAt, seededSessionId, conversationId);
   database.prepare(`
     INSERT INTO jobs (
       job_type, conversation_id, trigger_message_id, status, priority,
@@ -91,7 +107,7 @@ async function main(): Promise<void> {
   const processed = await worker.runSingleIteration();
   assert.equal(processed, true);
   assert.equal(fakeFeishu.sent.length >= 3, true);
-  assert.match(fakeFeishu.sent.at(-1) ?? '', /已完成 Codex worker 路径验证/);
+  assert.match(fakeFeishu.sent.at(-1) ?? '', /Codex worker path verified/);
 
   const conversationRow = database.prepare(`
     SELECT active_session_id
@@ -99,8 +115,9 @@ async function main(): Promise<void> {
     WHERE id = ?
   `).get(conversationId) as { active_session_id: number | null };
   assert.equal(typeof conversationRow.active_session_id, 'number');
+  assert.notEqual(conversationRow.active_session_id, seededSessionId);
 
-  const sessionRow = database.prepare(`
+  const newSessionRow = database.prepare(`
     SELECT codex_session_id, status
     FROM codex_sessions
     WHERE id = ?
@@ -108,17 +125,21 @@ async function main(): Promise<void> {
     codex_session_id: string;
     status: string;
   };
-  assert.equal(sessionRow.codex_session_id, 'thread-worker-1');
-  assert.equal(sessionRow.status, 'active');
+  assert.equal(newSessionRow.codex_session_id, 'thread-worker-2');
+  assert.equal(newSessionRow.status, 'active');
 
-  const runRow = database.prepare(`
-    SELECT status, final_reply_text
-    FROM codex_runs
-    ORDER BY id DESC
-    LIMIT 1
-  `).get() as { status: string; final_reply_text: string };
-  assert.equal(runRow.status, 'succeeded');
-  assert.equal(runRow.final_reply_text, '已完成 Codex worker 路径验证。');
+  const oldSessionRow = database.prepare(`
+    SELECT status
+    FROM codex_sessions
+    WHERE id = ?
+  `).get(seededSessionId) as { status: string };
+  assert.equal(oldSessionRow.status, 'broken');
+
+  const sessionManager = new CodexSessionManager(database);
+  const summary = sessionManager.getRunSummaryByJobId(1);
+  assert.equal(summary.attemptCount, 2);
+  assert.equal(summary.failedAttemptCount, 1);
+  assert.equal(summary.latestSuccessfulRun?.finalReplyText, 'Codex worker path verified.');
 
   database.close();
   console.log('Codex worker smoke checks passed.');
@@ -141,7 +162,56 @@ function seedConversation(
   `).run(workspaceRoot, projectName, projectPath, createdAt, createdAt, createdAt);
 
   return Number(
-    (database.prepare(`SELECT id FROM conversations WHERE conversation_key = 'chat-codex-worker'`).get() as { id: number }).id
+    (
+      database
+        .prepare(`SELECT id FROM conversations WHERE conversation_key = 'chat-codex-worker'`)
+        .get() as { id: number }
+    ).id
+  );
+}
+
+function seedBrokenResumeSession(
+  database: ReturnType<typeof openDatabase>,
+  conversationId: number,
+  projectPath: string
+): number {
+  const createdAt = nowIso();
+  database.prepare(`
+    INSERT INTO codex_sessions (
+      conversation_id, project_name, project_path, codex_session_id, status,
+      created_at, last_active_at, archived_at
+    ) VALUES (?, 'alpha', ?, 'thread-broken-old', 'active', ?, ?, NULL)
+  `).run(conversationId, projectPath, createdAt, createdAt);
+
+  return Number(
+    (
+      database
+        .prepare(`SELECT id FROM codex_sessions WHERE conversation_id = ? ORDER BY id DESC LIMIT 1`)
+        .get(conversationId) as { id: number }
+    ).id
+  );
+}
+
+function seedUserMessage(
+  database: ReturnType<typeof openDatabase>,
+  conversationId: number,
+  contentText: string
+): number {
+  const createdAt = nowIso();
+  database.prepare(`
+    INSERT INTO messages (
+      platform, conversation_id, platform_message_id, reply_to_message_id,
+      role, sender_open_id, content_text, content_json, token_input, token_output,
+      model, response_id, status, created_at
+    ) VALUES ('feishu', ?, ?, NULL, 'user', 'user-1', ?, '{}', NULL, NULL, NULL, NULL, 'received', ?)
+  `).run(conversationId, `msg-${Date.now()}`, contentText, createdAt);
+
+  return Number(
+    (
+      database
+        .prepare(`SELECT id FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1`)
+        .get(conversationId) as { id: number }
+    ).id
   );
 }
 
@@ -218,7 +288,9 @@ function createTestConfig(runtimeRoot: string, workspaceRoot: string): AppConfig
 class FakeFeishuMessageClient {
   public readonly sent: string[] = [];
 
-  public async replyText(input: { text: string }): Promise<{ platformMessageId: string; raw: Record<string, unknown> }> {
+  public async replyText(input: {
+    text: string;
+  }): Promise<{ platformMessageId: string; raw: Record<string, unknown> }> {
     this.sent.push(input.text);
     return {
       platformMessageId: `reply-${this.sent.length}`,

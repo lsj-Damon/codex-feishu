@@ -14,6 +14,7 @@ interface FakeCodexScript {
   sessionId: string;
   events: CodexRawEvent[];
   completion: Omit<CodexRunCompletion, 'codexSessionId'>;
+  waitForCompletionError?: Error;
 }
 
 export class FakeCodexCliClient implements CodexCliClient {
@@ -78,7 +79,12 @@ export class FakeCodexCliClient implements CodexCliClient {
 
     return {
       stream: createAsyncEventStream(script.events),
-      waitForCompletion: async () => completion,
+      waitForCompletion: async () => {
+        if (script.waitForCompletionError) {
+          throw script.waitForCompletionError;
+        }
+        return completion;
+      },
       cancel: async () => undefined
     };
   }

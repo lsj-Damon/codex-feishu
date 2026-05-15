@@ -20,7 +20,10 @@ import {
   resolveWorkspaceProject
 } from '../../domains/codex/control-commands.js';
 import { consumeCodexRunStream } from '../../domains/codex/stream-publisher.js';
-import type { CodexCliClient, CodexRunCompletion } from '../../domains/codex/types.js';
+import type {
+  CodexCliClient,
+  CodexRunCompletion
+} from '../../domains/codex/types.js';
 import { CodexSessionManager } from '../../domains/codex/session-manager.js';
 import { DeliveryRepository } from '../../domains/deliveries/repository.js';
 import { FeishuMessageClient } from '../../domains/feishu/client.js';
@@ -207,98 +210,19 @@ export class AssistantWorkerService {
       } else {
         const projectBinding =
           this.ensureConversationProjectBinding(conversation);
-
-        const session = this.codexSessionManager.ensureSessionForProject({
+        const execution = await this.executeCodexJob({
           conversationId: conversation.id,
-          workspaceRoot: this.config.codex.workspaceRoot,
-          projectName: projectBinding.projectName,
-          projectPath: projectBinding.projectPath
-        });
-        currentSessionId = session.id;
-
-        const run = this.codexSessionManager.createRun({
-          sessionId: session.id,
+          chatId: conversation.chatId,
+          replyToMessageId: triggerMessage.platformMessageId,
           jobId: job.id,
           userMessageId: triggerMessage.id,
-          promptText: this.buildCodexPrompt(
-            projectBinding.projectName,
-            conversation.id,
-            triggerMessage.contentText
-          )
+          projectName: projectBinding.projectName,
+          projectPath: projectBinding.projectPath,
+          latestUserText: triggerMessage.contentText,
+          logger: jobLogger
         });
-
-        this.codexSessionManager.markSessionBusy(session.id);
-        this.codexSessionManager.markRunRunning(run.id);
-
-        const outputDir = path.join(
-          this.config.runtimeRoot,
-          'runs',
-          'codex',
-          `run-${run.id}`
-        );
-        const handle = session.codexSessionId
-          ? await this.codexClient.resumeSession({
-              workspaceRoot: projectBinding.projectPath,
-              codexSessionId: session.codexSessionId,
-              promptText: run.promptText,
-              outputDir,
-              timeoutMs: this.config.codex.execTimeoutMs
-            })
-          : await this.codexClient.runNewSession({
-              workspaceRoot: projectBinding.projectPath,
-              promptText: run.promptText,
-              outputDir,
-              timeoutMs: this.config.codex.execTimeoutMs
-            });
-
-        codexCompletion = await runWithTimeout(
-          consumeCodexRunStream({
-            handle,
-            runId: run.id,
-            sessionManager: this.codexSessionManager,
-            sink: {
-              sendProgress: async (text) => {
-                const response = await this.feishuClient.replyText({
-                  chatId: conversation.chatId,
-                  replyToMessageId: triggerMessage.platformMessageId,
-                  text
-                });
-                return response.platformMessageId;
-              },
-              sendFinal: async () => null
-            },
-            progressIntervalMs:
-              this.config.codex.maxProgressMessageIntervalMs,
-            onWarning: (warning) => {
-              jobLogger.warn(warning);
-            },
-            onProgressDelivered: (info) => {
-              jobLogger.info('progress delivered to feishu', {
-                run_id: info.runId,
-                event_type: info.eventType,
-                feishu_message_id: info.feishuMessageId,
-                text_preview: info.text.slice(0, 120)
-              });
-            }
-          }),
-          this.config.codex.execTimeoutMs,
-          async () => {
-            await handle.cancel();
-          }
-        );
-
-        this.codexSessionManager.setCodexSessionId(
-          session.id,
-          codexCompletion.codexSessionId
-        );
-        this.codexSessionManager.completeRun(run.id, {
-          status: codexCompletion.exitCode === 0 ? 'succeeded' : 'failed',
-          exitCode: codexCompletion.exitCode,
-          jsonlPath: codexCompletion.jsonlPath,
-          stderrPath: codexCompletion.stderrPath,
-          finalReplyText: codexCompletion.finalMessageText
-        });
-        this.codexSessionManager.markSessionActive(session.id);
+        currentSessionId = execution.sessionId;
+        codexCompletion = execution.completion;
 
         await this.sendLocalReply({
           conversationId: conversation.id,
@@ -310,10 +234,11 @@ export class AssistantWorkerService {
             'Codex execution completed.',
           metadata: {
             source: 'codex',
-            sessionId: session.id,
+            sessionId: execution.sessionId,
             codexSessionId: codexCompletion.codexSessionId,
             projectName: projectBinding.projectName,
-            runId: run.id
+            runId: execution.runId,
+            jobRunSummary: this.codexSessionManager.getRunSummaryByJobId(job.id)
           }
         }, jobLogger);
       }
@@ -400,16 +325,18 @@ export class AssistantWorkerService {
           now
         );
         if (codexCompletion === null && currentSessionId) {
-          this.codexSessionManager.completeRun(
-            this.findLatestRunIdForJob(job.id),
-            {
+          const summary = this.codexSessionManager.getRunSummaryByJobId(job.id);
+          const runToComplete =
+            summary.activeRun ?? summary.latestAttemptRun;
+          if (runToComplete) {
+            this.codexSessionManager.completeRun(runToComplete.id, {
               status: 'failed',
               exitCode: null,
               jsonlPath: null,
               stderrPath: null,
               finalReplyText: classification.message
-            }
-          );
+            });
+          }
           this.codexSessionManager.markSessionIdle(currentSessionId);
         }
         this.state.lastErrorAt = now;
@@ -751,22 +678,207 @@ export class AssistantWorkerService {
     return null;
   }
 
-  private findLatestRunIdForJob(jobId: number): number {
-    const row = this.database
-      .prepare(`
-        SELECT id
-        FROM codex_runs
-        WHERE job_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-      `)
-      .get(jobId) as { id?: number } | undefined;
+  private async executeCodexJob(input: {
+    conversationId: number;
+    chatId: string;
+    replyToMessageId: string | null;
+    jobId: number;
+    userMessageId: number;
+    projectName: string;
+    projectPath: string;
+    latestUserText: string;
+    logger: AppLogger;
+  }): Promise<{
+    sessionId: number;
+    runId: number;
+    completion: CodexRunCompletion;
+  }> {
+    const initialSession = this.codexSessionManager.ensureSessionForProject({
+      conversationId: input.conversationId,
+      workspaceRoot: this.config.codex.workspaceRoot,
+      projectName: input.projectName,
+      projectPath: input.projectPath
+    });
 
-    if (!row?.id) {
-      throw new Error(`Missing codex run for job ${jobId}`);
+    try {
+      return await this.executeCodexRunAttempt({
+        ...input,
+        session: initialSession
+      });
+    } catch (error) {
+      if (!this.shouldReplaceBrokenSession(error, initialSession)) {
+        throw error;
+      }
+
+      input.logger.warn('replacing broken codex session after resume failure', {
+        session_id: initialSession.id,
+        codex_session_id: initialSession.codexSessionId,
+        error_message: error instanceof Error ? error.message : String(error)
+      });
+
+      const replacement = this.codexSessionManager.replaceBrokenSession({
+        conversationId: input.conversationId,
+        workspaceRoot: this.config.codex.workspaceRoot,
+        projectName: input.projectName,
+        projectPath: input.projectPath,
+        brokenSessionId: initialSession.id
+      });
+
+      return await this.executeCodexRunAttempt({
+        ...input,
+        session: replacement
+      });
+    }
+  }
+
+  private async executeCodexRunAttempt(input: {
+    conversationId: number;
+    chatId: string;
+    replyToMessageId: string | null;
+    jobId: number;
+    userMessageId: number;
+    projectName: string;
+    projectPath: string;
+    latestUserText: string;
+    logger: AppLogger;
+    session: { id: number; codexSessionId: string | null };
+  }): Promise<{
+    sessionId: number;
+    runId: number;
+    completion: CodexRunCompletion;
+  }> {
+    const run = this.codexSessionManager.createRun({
+      sessionId: input.session.id,
+      jobId: input.jobId,
+      userMessageId: input.userMessageId,
+      promptText: this.buildCodexPrompt(
+        input.projectName,
+        input.conversationId,
+        input.latestUserText
+      )
+    });
+
+    this.codexSessionManager.markSessionBusy(input.session.id);
+    this.codexSessionManager.markRunRunning(run.id);
+
+    const outputDir = path.join(
+      this.config.runtimeRoot,
+      'runs',
+      'codex',
+      `run-${run.id}`
+    );
+    const handle = input.session.codexSessionId
+      ? await this.codexClient.resumeSession({
+          workspaceRoot: input.projectPath,
+          codexSessionId: input.session.codexSessionId,
+          promptText: run.promptText,
+          outputDir,
+          timeoutMs: this.config.codex.execTimeoutMs
+        })
+      : await this.codexClient.runNewSession({
+          workspaceRoot: input.projectPath,
+          promptText: run.promptText,
+          outputDir,
+          timeoutMs: this.config.codex.execTimeoutMs
+        });
+
+    try {
+      const completion = await runWithTimeout(
+        consumeCodexRunStream({
+          handle,
+          runId: run.id,
+          sessionManager: this.codexSessionManager,
+          sink: {
+            sendProgress: async (text) => {
+              const response = await this.feishuClient.replyText({
+                chatId: input.chatId,
+                replyToMessageId: input.replyToMessageId,
+                text
+              });
+              return response.platformMessageId;
+            },
+            sendFinal: async () => null
+          },
+          progressIntervalMs:
+            this.config.codex.maxProgressMessageIntervalMs,
+          onWarning: (warning) => {
+            input.logger.warn(warning, {
+              run_id: run.id,
+              session_id: input.session.id
+            });
+          },
+          onProgressDelivered: (info) => {
+            input.logger.info('progress delivered to feishu', {
+              run_id: info.runId,
+              event_type: info.eventType,
+              category: info.category,
+              feishu_message_id: info.feishuMessageId,
+              text_preview: info.text.slice(0, 120)
+            });
+          }
+        }),
+        this.config.codex.execTimeoutMs,
+        async () => {
+          await handle.cancel();
+        }
+      );
+
+      this.codexSessionManager.setCodexSessionId(
+        input.session.id,
+        completion.codexSessionId
+      );
+      this.codexSessionManager.completeRun(run.id, {
+        status: completion.exitCode === 0 ? 'succeeded' : 'failed',
+        exitCode: completion.exitCode,
+        jsonlPath: completion.jsonlPath,
+        stderrPath: completion.stderrPath,
+        finalReplyText: completion.finalMessageText
+      });
+      this.codexSessionManager.markSessionActive(input.session.id);
+
+      return {
+        sessionId: input.session.id,
+        runId: run.id,
+        completion
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.codexSessionManager.completeRun(run.id, {
+        status: 'failed',
+        exitCode: null,
+        jsonlPath: null,
+        stderrPath: null,
+        finalReplyText: message
+      });
+
+      if (this.shouldReplaceBrokenSession(error, input.session)) {
+        this.codexSessionManager.markSessionBroken(input.session.id);
+      } else {
+        this.codexSessionManager.markSessionIdle(input.session.id);
+      }
+
+      throw error;
+    }
+  }
+
+  private shouldReplaceBrokenSession(
+    error: unknown,
+    session: { codexSessionId: string | null }
+  ): boolean {
+    if (!session.codexSessionId) {
+      return false;
     }
 
-    return Number(row.id);
+    const message = error instanceof Error ? error.message : String(error);
+    const lower = message.toLowerCase();
+
+    return (
+      lower.includes('resume') ||
+      lower.includes('thread') ||
+      lower.includes('session') ||
+      lower.includes('broken pipe') ||
+      lower.includes('epipe')
+    );
   }
 }
 

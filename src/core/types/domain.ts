@@ -32,6 +32,15 @@ export type CodexRunStatus =
   | 'failed'
   | 'cancelled'
   | 'timeout';
+export type CodexProgressCategory =
+  | 'session'
+  | 'turn'
+  | 'status'
+  | 'reasoning'
+  | 'tool'
+  | 'command'
+  | 'warning'
+  | 'final';
 
 export interface NormalizedAttachment {
   kind: AttachmentKind;
@@ -176,6 +185,15 @@ export interface CodexRunRecord {
   finalReplyText: string | null;
   startedAt: string;
   finishedAt: string | null;
+}
+
+export interface CodexJobRunSummary {
+  activeRun: CodexRunRecord | null;
+  latestAttemptRun: CodexRunRecord | null;
+  latestFinishedRun: CodexRunRecord | null;
+  latestSuccessfulRun: CodexRunRecord | null;
+  attemptCount: number;
+  failedAttemptCount: number;
 }
 
 export interface CodexStreamEventRecord {

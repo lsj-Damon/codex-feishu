@@ -1,128 +1,69 @@
-﻿# Progress Log
+# Progress Log
 
-## Session: 2026-05-14 Architecture and Codex CLI Feasibility Analysis
+## Session: 2026-05-15 Codex Worker Second-Round Enhancements
 
-### Phase 1: Setup and Entry-point Discovery
+### Phase 1: Design and Scope
 - **Status:** complete
-- **Started:** 2026-05-14
 - Actions taken:
-  - Confirmed the user wants analysis artifacts written under `D:\Develop\workspace\feishu-server`.
-  - Read existing planning files and GitNexus-generated `AGENTS.md` context.
-  - Inspected package scripts and top-level source layout.
-  - Read both application entrypoints (`bot-gateway/main.ts`, `assistant-worker/main.ts`).
-  - Read core configuration and database startup modules.
+  - Read the brainstorming and planning-with-files skills and followed the required design-first flow.
+  - Inspected the current Codex session manager, event translator, stream publisher, run repository, worker service, and planning docs.
+  - Confirmed with the user that job/run query optimization should prioritize operations and debugging visibility.
+  - Wrote the approved design document under `docs/plans/2026-05-15-feishu-codex-round2-enhancements-design.md`.
 - Files created/modified:
-  - task_plan.md (rewritten for current analysis task)
-  - findings.md (updated for architecture findings)
-  - progress.md (updated)
+  - task_plan.md
+  - findings.md
+  - progress.md
+  - docs/plans/2026-05-15-feishu-codex-round2-enhancements-design.md
 
-### Phase 2: Primary Runtime Flow Trace
+### Phase 2: Broken Session Recovery
 - **Status:** complete
 - Actions taken:
-  - Read gateway service end-to-end to trace ingress, dedupe, trigger policy, persistence, and job enqueue behavior.
-  - Read worker service end-to-end to trace leasing, context building, OpenAI call path, delivery retries, image handling, and summary refresh.
-  - Read Feishu ingress and Feishu client adapters.
-  - Read OpenAI client, context builder, response policy, message repository, and job repository.
-- Intermediate conclusion:
-  - The system is clearly split into synchronous ingress and asynchronous job execution, with SQLite as the shared state machine boundary.
-
-### Phase 3: Persistence, Operations, and Codex CLI Assessment
-- **Status:** complete
-- Actions taken:
-  - Read migrations and persistence repositories for conversations, deliveries, attachments, and raw events.
-  - Read health reporting, single-instance locking, README, runbook, and operations docs to capture runtime constraints and operational shape.
-  - Inspected current Codex CLI command surfaces (`exec`, `exec resume`, `review`, `mcp-server`) to assess realistic integration boundaries.
-  - Wrote the final architecture and feasibility report with Mermaid diagrams into the repository root.
+  - Updated the session repository to ignore `broken` sessions when resolving reusable project sessions.
+  - Added replacement-session creation to `CodexSessionManager`.
+  - Refactored the worker Codex path so a failed resume can mark the old session broken, create a replacement session, and retry once in-process.
 - Files created/modified:
-  - AGENTS.md (updated with `output_dir` config)
-  - feishu-server-architecture-report.md (created)
-  - task_plan.md (updated)
-  - findings.md (updated)
-  - progress.md (updated)
+  - src/domains/codex/session-repository.ts
+  - src/domains/codex/session-manager.ts
+  - src/apps/assistant-worker/service.ts
 
-## Session: 2026-05-14 Codex CLI PoC Implementation
-
-### Phase 1: Step 1 Foundations
+### Phase 3: Progress Classification
 - **Status:** complete
 - Actions taken:
-  - Wrote the Codex CLI session-manager design document under `docs/plans`.
-  - Added the initial migration for conversation project binding and Codex session/run/event persistence.
-  - Extended domain types with Codex session, run, and stream-event records.
-  - Extended runtime config and `.env.example` with Codex-specific execution settings.
+  - Extended Codex translated events with structured categories.
+  - Replaced the previous minimal translator with category-aware handling for session, turn, tool, command, warning, and final events.
+  - Propagated category information through stream publishing and worker progress logs.
 - Files created/modified:
-  - docs/plans/2026-05-14-feishu-codex-cli-session-manager-design.md (created)
-  - migrations/0004_codex_sessions.sql (created)
-  - src/core/types/domain.ts (updated)
-  - src/core/config/index.ts (updated)
-  - config/default.json (updated)
-  - .env.example (updated)
-  - task_plan.md (updated)
-  - findings.md (updated)
-  - progress.md (updated)
+  - src/core/types/domain.ts
+  - src/domains/codex/types.ts
+  - src/domains/codex/event-translator.ts
+  - src/domains/codex/stream-publisher.ts
 
-### Phase 2: Step 2 Control Commands
+### Phase 4: Job/Run Query Ergonomics
 - **Status:** complete
 - Actions taken:
-  - Added project control-command parsing for `项目列表`, `当前项目`, `切换项目 <name>`, and `新建项目 <name>`.
-  - Extended `ConversationRepository` with project binding updates.
-  - Added local worker handling for control commands and a smoke test for project binding behavior.
+  - Added job-centric run queries and a consolidated history summary to the run repository.
+  - Replaced the worker's raw latest-run SQL with repository/session-manager summary access.
+  - Included job-run summary metadata in the final Codex reply persistence path.
 - Files created/modified:
-  - src/domains/codex/control-commands.ts (created)
-  - src/domains/conversation/repository.ts (updated)
-  - src/apps/assistant-worker/service.ts (updated)
-  - src/scripts/codex-control-smoke.ts (created)
-  - package.json (updated)
+  - src/core/types/domain.ts
+  - src/domains/codex/run-repository.ts
+  - src/domains/codex/session-manager.ts
+  - src/apps/assistant-worker/service.ts
 
-### Phase 3: Step 3 Session Persistence
+### Phase 5: Verification
 - **Status:** complete
 - Actions taken:
-  - Added repositories for Codex sessions, runs, and stream events.
-  - Added `CodexSessionManager` for project-scoped session reuse and run persistence.
-  - Added a smoke test covering session switching and event persistence.
+  - Extended the fake Codex client to simulate completion-stage resume failures.
+  - Updated the session-manager smoke for broken-session replacement.
+  - Rewrote the streaming smoke and worker smoke in clean ASCII-safe form and added assertions for categories and replacement-session recovery.
+  - Ran:
+    - `npm.cmd run typecheck`
+    - `npm.cmd run build`
+    - `npm.cmd run smoke:codex-session-manager`
+    - `npm.cmd run smoke:codex-streaming`
+    - `npm.cmd run smoke:codex-worker`
 - Files created/modified:
-  - src/domains/codex/session-repository.ts (created)
-  - src/domains/codex/run-repository.ts (created)
-  - src/domains/codex/stream-event-repository.ts (created)
-  - src/domains/codex/session-manager.ts (created)
-  - src/scripts/codex-session-manager-smoke.ts (created)
-  - package.json (updated)
-
-### Phase 4: Step 4 Fake Streaming Pipeline
-- **Status:** complete
-- Actions taken:
-  - Added Codex stream types, fake client, event translator, progress buffer, and stream publisher.
-  - Added a smoke test for fake progress streaming and final-message handling.
-- Files created/modified:
-  - src/domains/codex/types.ts (created)
-  - src/domains/codex/fake-client.ts (created)
-  - src/domains/codex/event-translator.ts (created)
-  - src/domains/codex/progress-buffer.ts (created)
-  - src/domains/codex/stream-publisher.ts (created)
-  - src/scripts/codex-streaming-smoke.ts (created)
-  - package.json (updated)
-
-### Phase 5: Step 5 Real Codex CLI Integration
-- **Status:** complete
-- Actions taken:
-  - Added a real Codex CLI client that parses JSON events from noisy stdout/stderr.
-  - Verified thread id capture and final assistant message extraction through a real smoke test.
-- Files created/modified:
-  - src/domains/codex/client.ts (created)
-  - src/scripts/codex-real-smoke.ts (created)
-  - package.json (updated)
-
-### Phase 6: Step 6 Worker Integration, Timeout, and Validation
-- **Status:** complete
-- Actions taken:
-  - Switched ordinary worker message execution to the Codex session/run pipeline.
-  - Removed hard worker startup dependence on `OPENAI_API_KEY`.
-  - Added timeout cleanup, session-broken marking on resume failures, and a full worker-path smoke test.
-  - Re-verified Codex control, session-manager, streaming, real client, and worker integration smokes.
-- Files created/modified:
-  - src/apps/assistant-worker/service.ts (rewritten)
-  - src/apps/assistant-worker/main.ts (updated)
-  - src/core/config/index.ts (updated)
-  - src/domains/codex/client.ts (updated)
-  - src/domains/codex/session-manager.ts (updated)
-  - src/scripts/codex-worker-smoke.ts (created)
-  - package.json (updated)
+  - src/domains/codex/fake-client.ts
+  - src/scripts/codex-session-manager-smoke.ts
+  - src/scripts/codex-streaming-smoke.ts
+  - src/scripts/codex-worker-smoke.ts

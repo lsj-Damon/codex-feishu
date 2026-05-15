@@ -2,6 +2,7 @@ import { executeInTransaction } from '../../core/db/database.js';
 import type { DatabaseSync } from 'node:sqlite';
 
 import type {
+  CodexJobRunSummary,
   CodexRunRecord,
   CodexSessionRecord
 } from '../../core/types/domain.js';
@@ -31,7 +32,7 @@ export class CodexSessionManager {
     projectPath: string;
   }): CodexSessionRecord {
     return executeInTransaction(this.database, () => {
-      const existing = this.sessions.findByConversationAndProject(
+      const existing = this.sessions.findLatestUsableByConversationAndProject(
         input.conversationId,
         input.projectPath
       );
@@ -61,6 +62,41 @@ export class CodexSessionManager {
         status: 'active',
         createdAt: timestamp
       });
+      this.sessions.deactivateOtherSessions(
+        input.conversationId,
+        created.id,
+        timestamp
+      );
+      this.conversations.bindProject(input.conversationId, {
+        workspaceRoot: input.workspaceRoot,
+        projectName: input.projectName,
+        projectPath: input.projectPath,
+        activeSessionId: created.id,
+        switchedAt: timestamp
+      });
+      return created;
+    });
+  }
+
+  public replaceBrokenSession(input: {
+    conversationId: number;
+    workspaceRoot: string;
+    projectName: string;
+    projectPath: string;
+    brokenSessionId: number;
+  }): CodexSessionRecord {
+    return executeInTransaction(this.database, () => {
+      const timestamp = nowIso();
+      this.sessions.updateStatus(input.brokenSessionId, 'broken', timestamp);
+
+      const created = this.sessions.create({
+        conversationId: input.conversationId,
+        projectName: input.projectName,
+        projectPath: input.projectPath,
+        status: 'active',
+        createdAt: timestamp
+      });
+
       this.sessions.deactivateOtherSessions(
         input.conversationId,
         created.id,
@@ -159,5 +195,17 @@ export class CodexSessionManager {
 
   public listRunEvents(runId: number) {
     return this.streamEvents.listByRunId(runId);
+  }
+
+  public getActiveRunByJobId(jobId: number): CodexRunRecord | null {
+    return this.runs.getActiveByJobId(jobId);
+  }
+
+  public getLatestSuccessfulRunByJobId(jobId: number): CodexRunRecord | null {
+    return this.runs.getLatestSuccessfulByJobId(jobId);
+  }
+
+  public getRunSummaryByJobId(jobId: number): CodexJobRunSummary {
+    return this.runs.getJobHistorySummary(jobId);
   }
 }

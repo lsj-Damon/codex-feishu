@@ -22,6 +22,7 @@ export async function consumeCodexRunStream(input: {
   onProgressDelivered?: (info: {
     runId: number;
     eventType: string;
+    category: string;
     text: string;
     feishuMessageId: string | null;
   }) => void;
@@ -49,6 +50,7 @@ export async function consumeCodexRunStream(input: {
             input.onProgressDelivered?.({
               runId: input.runId,
               eventType: item.eventType,
+              category: item.category,
               text: item.text,
               feishuMessageId
             });

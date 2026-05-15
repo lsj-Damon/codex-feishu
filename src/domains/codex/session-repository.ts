@@ -80,6 +80,24 @@ export class CodexSessionRepository {
     return row ? mapCodexSessionRow(row as Record<string, unknown>) : null;
   }
 
+  public findLatestUsableByConversationAndProject(
+    conversationId: number,
+    projectPath: string
+  ): CodexSessionRecord | null {
+    const row = this.database
+      .prepare(`
+        SELECT *
+        FROM codex_sessions
+        WHERE conversation_id = ?
+          AND project_path = ?
+          AND status NOT IN ('archived', 'broken')
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .get(conversationId, projectPath);
+    return row ? mapCodexSessionRow(row as Record<string, unknown>) : null;
+  }
+
   public updateStatus(id: number, status: CodexSessionStatus, updatedAt: string): void {
     this.database
       .prepare(`

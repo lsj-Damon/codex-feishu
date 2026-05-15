@@ -12,3 +12,5 @@ dist/
 .swarm/
 .mcp.json
 ruvector.db
+agentdb.rvf
+agentdb.rvf.lock
