@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { AssistantWorkerService } from '../apps/assistant-worker/service.js';
@@ -19,6 +19,9 @@ async function main(): Promise<void> {
   mkdirSync(runtimeRoot, { recursive: true });
 
   await testAnalyzeProjectAlias(runtimeRoot);
+  rmSync(runtimeRoot, { recursive: true, force: true });
+  mkdirSync(runtimeRoot, { recursive: true });
+  await testResumeSessionWithImage(runtimeRoot);
   rmSync(runtimeRoot, { recursive: true, force: true });
   mkdirSync(runtimeRoot, { recursive: true });
 
@@ -358,6 +361,7 @@ function createTestConfig(runtimeRoot: string, workspaceRoot: string): AppConfig
 
 class FakeFeishuMessageClient {
   public readonly sent: string[] = [];
+  public downloadCalls = 0;
 
   public async replyText(input: {
     text: string;
@@ -367,6 +371,15 @@ class FakeFeishuMessageClient {
       platformMessageId: `reply-${this.sent.length}`,
       raw: {}
     };
+  }
+
+  public async downloadImage(
+    _messageId: string,
+    _imageKey: string,
+    localPath: string
+  ): Promise<void> {
+    this.downloadCalls += 1;
+    writeFileSync(localPath, createTinyPngBuffer());
   }
 }
 
@@ -419,6 +432,174 @@ class AssertingCodexCliClient extends FakeCodexCliClient {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+async function testResumeSessionWithImage(runtimeRoot: string): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace-image');
+  const projectPath = path.join(workspaceRoot, 'alpha');
+  mkdirSync(projectPath, { recursive: true });
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-worker-smoke-image',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(
+    database,
+    workspaceRoot,
+    'alpha',
+    projectPath,
+    'chat-codex-worker-image'
+  );
+  const sessionId = seedHealthyResumeSession(
+    database,
+    conversationId,
+    projectPath,
+    'thread-image-resume'
+  );
+  const triggerMessageId = seedUserMessage(
+    database,
+    conversationId,
+    'I attached the latest run screenshot, analyze it and fix the issue.'
+  );
+  seedImageAttachment(database, triggerMessageId, 'img_resume_1');
+  const createdAt = nowIso();
+  database.prepare(`
+    UPDATE conversations
+    SET last_user_message_id = ?, message_count = 1, last_activity_at = ?, updated_at = ?, active_session_id = ?
+    WHERE id = ?
+  `).run(triggerMessageId, createdAt, createdAt, sessionId, conversationId);
+  database.prepare(`
+    INSERT INTO jobs (
+      job_type, conversation_id, trigger_message_id, status, priority,
+      attempt_count, max_attempts, available_at, locked_by, lease_expires_at,
+      last_error_code, last_error_message, result_message_id, created_at, updated_at
+    ) VALUES ('reply_generation', ?, ?, 'queued', 0, 0, 4, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+  `).run(conversationId, triggerMessageId, createdAt, createdAt, createdAt);
+
+  const fakeFeishu = new FakeFeishuMessageClient();
+  const fakeCodex = new FakeCodexCliClient([
+    {
+      sessionId: 'thread-image-resume',
+      events: [
+        { type: 'turn.started' },
+        createProgressMessageEvent('Reviewing attached screenshot'),
+        {
+          type: 'item.completed',
+          item: {
+            type: 'agent_message',
+            text: 'The screenshot confirms the failing state. I updated the relevant code path.'
+          }
+        }
+      ],
+      completion: {
+        exitCode: 0,
+        finalMessageText:
+          'The screenshot confirms the failing state. I updated the relevant code path.',
+        jsonlPath: path.join(runtimeRoot, 'resume-image.jsonl'),
+        stderrPath: path.join(runtimeRoot, 'resume-image.stderr')
+      }
+    }
+  ]);
+  const worker = new AssistantWorkerService(
+    config,
+    database,
+    logger,
+    fakeFeishu as any,
+    null,
+    new HealthReporter('worker', config.paths.healthFile),
+    fakeCodex
+  );
+
+  const processed = await worker.runSingleIteration();
+  assert.equal(processed, true);
+  assert.equal(fakeFeishu.downloadCalls, 1);
+  assert.equal(fakeCodex.resumeSessionInputs.length, 1);
+  assert.equal(fakeCodex.runNewSessionInputs.length, 0);
+  assert.equal(fakeCodex.resumeSessionInputs[0]?.imagePaths?.length, 1);
+  assert.ok(
+    fakeCodex.resumeSessionInputs[0]?.imagePaths?.[0]?.endsWith(
+      'img_resume_1.bin'
+    )
+  );
+  assert.match(
+    fakeCodex.resumeSessionInputs[0]?.promptText ?? '',
+    /downloaded successfully and attached to this turn/i
+  );
+  assert.doesNotMatch(
+    fakeCodex.resumeSessionInputs[0]?.promptText ?? '',
+    /图片附件当前不通|截图附件没有成功传到|Screenshot attachment warning/i
+  );
+
+  const attachmentRow = database.prepare(`
+    SELECT status, mime_type, local_path
+    FROM message_attachments
+    WHERE message_id = ?
+  `).get(triggerMessageId) as {
+    status: string;
+    mime_type: string | null;
+    local_path: string | null;
+  };
+  assert.equal(attachmentRow.status, 'downloaded');
+  assert.equal(attachmentRow.mime_type, 'image/png');
+  assert.ok((attachmentRow.local_path ?? '').endsWith('img_resume_1.bin'));
+
+  database.close();
+}
+
+function seedHealthyResumeSession(
+  database: ReturnType<typeof openDatabase>,
+  conversationId: number,
+  projectPath: string,
+  codexSessionId: string
+): number {
+  const createdAt = nowIso();
+  database.prepare(`
+    INSERT INTO codex_sessions (
+      conversation_id, project_name, project_path, codex_session_id, status,
+      created_at, last_active_at, archived_at
+    ) VALUES (?, 'alpha', ?, ?, 'active', ?, ?, NULL)
+  `).run(conversationId, projectPath, codexSessionId, createdAt, createdAt);
+
+  return Number(
+    (
+      database
+        .prepare(`SELECT id FROM codex_sessions WHERE conversation_id = ? ORDER BY id DESC LIMIT 1`)
+        .get(conversationId) as { id: number }
+    ).id
+  );
+}
+
+function seedImageAttachment(
+  database: ReturnType<typeof openDatabase>,
+  messageId: number,
+  remoteKey: string
+): void {
+  const createdAt = nowIso();
+  database.prepare(`
+    INSERT INTO message_attachments (
+      message_id, attachment_index, provider, attachment_kind, remote_key,
+      local_path, mime_type, status, width, height, metadata_json,
+      last_error_message, created_at, updated_at
+    ) VALUES (?, 0, 'feishu', 'image', ?, NULL, NULL, 'pending', NULL, NULL, ?, NULL, ?, ?)
+  `).run(
+    messageId,
+    remoteKey,
+    JSON.stringify({ image_key: remoteKey }),
+    createdAt,
+    createdAt
+  );
+}
+
+function createTinyPngBuffer(): Buffer {
+  return Buffer.from(
+    '89504E470D0A1A0A0000000D49484452000000010000000108060000001F15C4890000000D49444154789C6360000002000154A24F5D0000000049454E44AE426082',
+    'hex'
+  );
 }
 
 void main().catch((error) => {

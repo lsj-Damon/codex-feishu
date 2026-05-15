@@ -79,16 +79,30 @@ export class FeishuMessageClient {
   }
 
   public async downloadImage(
+    messageId: string,
     imageKey: string,
     localPath: string
   ): Promise<void> {
-    const response = await this.client.im.image.get({
-      path: {
-        image_key: imageKey
-      }
-    });
+    try {
+      const response = await this.client.im.messageResource.get({
+        params: {
+          type: 'image'
+        },
+        path: {
+          message_id: messageId,
+          file_key: imageKey
+        }
+      });
 
-    await response.writeFile(localPath);
+      await response.writeFile(localPath);
+    } catch (error) {
+      this.logger.warn('feishu messageResource image download failed', {
+        messageId,
+        imageKey,
+        error: serializeFeishuError(error)
+      });
+      throw error;
+    }
   }
 }
 
@@ -99,4 +113,31 @@ function extractPlatformMessageId(response: any): string | null {
     response?.message_id ??
     null
   );
+}
+
+function serializeFeishuError(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) {
+    return {
+      message: String(error)
+    };
+  }
+
+  const anyError = error as any;
+  return {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    code: anyError.code ?? null,
+    status: anyError.status ?? anyError.response?.status ?? null,
+    responseData:
+      anyError.response?.data ??
+      anyError.response?.body ??
+      anyError.data ??
+      null,
+    responseHeaders: anyError.response?.headers ?? null,
+    logId:
+      anyError.response?.data?.error?.log_id ??
+      anyError.response?.data?.log_id ??
+      null
+  };
 }

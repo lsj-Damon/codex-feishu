@@ -10,6 +10,8 @@ import { openDatabase } from '../core/db/database.js';
 import { runMigrations } from '../core/db/migrations.js';
 import { HealthReporter } from '../core/health/reporter.js';
 import { AppLogger } from '../core/logger/logger.js';
+import { FakeCodexCliClient } from '../domains/codex/fake-client.js';
+import { createProgressMessageEvent } from '../domains/codex/stream-publisher.js';
 
 async function main(): Promise<void> {
   const runtimeRoot = path.join(process.cwd(), '.runtime', 'image-mvp-smoke');
@@ -33,7 +35,10 @@ async function main(): Promise<void> {
       start: async () => undefined,
       stop: async () => undefined
     } as any,
-    new HealthReporter('gateway', path.join(config.paths.runDir, 'gateway.health.json'))
+    new HealthReporter(
+      'gateway',
+      path.join(config.paths.runDir, 'gateway.health.json')
+    )
   );
 
   await gateway.processIncomingPayload({
@@ -56,12 +61,39 @@ async function main(): Promise<void> {
   });
 
   const attachmentCount = Number(
-    (database.prepare('SELECT COUNT(*) AS count FROM message_attachments').get() as { count: number }).count
+    (
+      database.prepare('SELECT COUNT(*) AS count FROM message_attachments').get() as {
+        count: number;
+      }
+    ).count
   );
   assert.equal(attachmentCount, 1);
 
-  const fakeOpenAi = new FakeOpenAiClient();
   const fakeFeishu = new FakeFeishuMessageClient();
+  const fakeCodex = new FakeCodexCliClient([
+    {
+      sessionId: 'thread-image-1',
+      events: [
+        { type: 'thread.started', thread_id: 'thread-image-1' },
+        { type: 'turn.started' },
+        createProgressMessageEvent('Inspecting screenshot'),
+        {
+          type: 'item.completed',
+          item: {
+            type: 'agent_message',
+            text: 'The screenshot shows a runtime error. Check the stack trace and failing component.'
+          }
+        }
+      ],
+      completion: {
+        exitCode: 0,
+        finalMessageText:
+          'The screenshot shows a runtime error. Check the stack trace and failing component.',
+        jsonlPath: path.join(runtimeRoot, 'image-run.jsonl'),
+        stderrPath: path.join(runtimeRoot, 'image-run.stderr')
+      }
+    }
+  ]);
   const workerLogger = new AppLogger(
     'image-mvp-smoke-worker',
     path.join(config.paths.logsDir, 'worker.log')
@@ -71,24 +103,36 @@ async function main(): Promise<void> {
     database,
     workerLogger,
     fakeFeishu as any,
-    fakeOpenAi as any,
-    new HealthReporter('worker', config.paths.healthFile)
+    null,
+    new HealthReporter('worker', config.paths.healthFile),
+    fakeCodex
   );
 
   await worker.runSingleIteration();
 
-  assert.equal(fakeFeishu.replyCalls, 1);
+  assert.equal(fakeFeishu.replyCalls >= 2, true);
   assert.equal(fakeFeishu.downloadCalls, 1);
-  assert.equal(fakeOpenAi.calls, 1);
-  assert.equal(fakeOpenAi.lastTriggerImages?.length, 1);
-  assert.ok(fakeOpenAi.lastTriggerImages?.[0]?.dataUrl.startsWith('data:image/png;base64,'));
+  assert.equal(fakeCodex.runNewSessionInputs.length, 1);
+  assert.equal(fakeCodex.resumeSessionInputs.length, 0);
+  assert.equal(fakeCodex.runNewSessionInputs[0]?.imagePaths?.length, 1);
+  assert.ok(
+    fakeCodex.runNewSessionInputs[0]?.imagePaths?.[0]?.endsWith(
+      'img_test_single.bin'
+    )
+  );
 
   const downloadedCount = Number(
-    (database.prepare("SELECT COUNT(*) AS count FROM message_attachments WHERE status = 'downloaded'").get() as { count: number }).count
+    (
+      database
+        .prepare(
+          "SELECT COUNT(*) AS count FROM message_attachments WHERE status = 'downloaded'"
+        )
+        .get() as { count: number }
+    ).count
   );
   assert.equal(downloadedCount, 1);
 
-  console.log('Single-image MVP smoke checks passed.');
+  console.log('Single-image Codex smoke checks passed.');
   database.close();
 }
 
@@ -178,40 +222,13 @@ class FakeFeishuMessageClient {
     };
   }
 
-  public async downloadImage(_imageKey: string, localPath: string): Promise<void> {
+  public async downloadImage(
+    _messageId: string,
+    _imageKey: string,
+    localPath: string
+  ): Promise<void> {
     this.downloadCalls += 1;
     writeFileSync(localPath, createTinyPngBuffer());
-  }
-}
-
-class FakeOpenAiClient {
-  public calls = 0;
-  public lastTriggerImages:
-    | Array<{ dataUrl: string; mimeType: string }>
-    | undefined;
-
-  public async generateReply(input: {
-    triggerImages?: Array<{ dataUrl: string; mimeType: string }>;
-  }): Promise<{
-    text: string;
-    responseId: string;
-    model: string;
-    inputTokens: number;
-    outputTokens: number;
-    usedPreviousResponseId: boolean;
-    fellBackFromPreviousResponseId: boolean;
-  }> {
-    this.calls += 1;
-    this.lastTriggerImages = input.triggerImages;
-    return {
-      text: '这张图片里是报错截图，建议先看报错关键字和对应代码位置。',
-      responseId: `resp-${this.calls}`,
-      model: 'gpt-5.4-mini',
-      inputTokens: 10,
-      outputTokens: 20,
-      usedPreviousResponseId: false,
-      fellBackFromPreviousResponseId: false
-    };
   }
 }
 

@@ -5,6 +5,7 @@ export interface CodexRunInput {
   promptText: string;
   outputDir: string;
   timeoutMs: number;
+  imagePaths?: string[];
 }
 
 export interface CodexResumeInput extends CodexRunInput {

@@ -19,16 +19,20 @@ interface FakeCodexScript {
 
 export class FakeCodexCliClient implements CodexCliClient {
   private scriptCounter = 0;
+  public readonly runNewSessionInputs: CodexRunInput[] = [];
+  public readonly resumeSessionInputs: CodexResumeInput[] = [];
 
   public constructor(private readonly scripts: FakeCodexScript[] = []) {}
 
   public async runNewSession(input: CodexRunInput): Promise<CodexRunHandle> {
+    this.runNewSessionInputs.push(input);
     return this.createHandle(
       this.nextScript(input.outputDir, `fake-thread-${this.scriptCounter + 1}`)
     );
   }
 
   public async resumeSession(input: CodexResumeInput): Promise<CodexRunHandle> {
+    this.resumeSessionInputs.push(input);
     return this.createHandle(
       this.nextScript(input.outputDir, input.codexSessionId)
     );

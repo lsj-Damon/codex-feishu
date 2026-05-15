@@ -21,7 +21,8 @@ export class RealCodexCliClient implements CodexCliClient {
         cliPath: this.cliPath,
         workspaceRoot: input.workspaceRoot,
         mode: 'new',
-        promptFile: writePromptFile(input.outputDir, input.promptText)
+        promptFile: writePromptFile(input.outputDir, input.promptText),
+        imagePaths: input.imagePaths ?? []
       }),
       input.outputDir
     );
@@ -34,7 +35,8 @@ export class RealCodexCliClient implements CodexCliClient {
         workspaceRoot: input.workspaceRoot,
         mode: 'resume',
         sessionId: input.codexSessionId,
-        promptFile: writePromptFile(input.outputDir, input.promptText)
+        promptFile: writePromptFile(input.outputDir, input.promptText),
+        imagePaths: input.imagePaths ?? []
       }),
       input.outputDir
     );
@@ -214,6 +216,7 @@ function buildLauncherArgs(input: {
   mode: 'new' | 'resume';
   promptFile: string;
   sessionId?: string;
+  imagePaths: string[];
 }): string[] {
   const args = [
     '--cliPath',
@@ -228,6 +231,10 @@ function buildLauncherArgs(input: {
 
   if (input.sessionId) {
     args.push('--sessionId', input.sessionId);
+  }
+
+  for (const imagePath of input.imagePaths) {
+    args.push('--imagePath', imagePath);
   }
 
   return args;

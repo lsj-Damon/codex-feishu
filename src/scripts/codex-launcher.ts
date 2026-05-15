@@ -9,6 +9,7 @@ interface LauncherArgs {
   mode: Mode;
   sessionId?: string;
   promptFile: string;
+  imagePaths: string[];
 }
 
 function main(): void {
@@ -98,6 +99,15 @@ function parseArgs(argv: string[]): LauncherArgs {
   const mode = map.get('mode') as Mode | undefined;
   const promptFile = map.get('promptFile');
   const sessionId = map.get('sessionId');
+  const imagePaths: string[] = [];
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const imagePath = argv[i + 1];
+    if (argv[i] === '--imagePath' && imagePath) {
+      imagePaths.push(imagePath);
+      i += 1;
+    }
+  }
 
   if (!cliPath || !workspaceRoot || !mode || !promptFile) {
     throw new Error('Missing required launcher args.');
@@ -111,17 +121,20 @@ function parseArgs(argv: string[]): LauncherArgs {
     workspaceRoot,
     mode,
     sessionId,
-    promptFile
+    promptFile,
+    imagePaths
   };
 }
 
 function buildSpawnSpec(args: LauncherArgs): { command: string; args: string[] } {
+  const imageArgs = args.imagePaths.flatMap((imagePath) => ['-i', imagePath]);
   const codexArgs =
     args.mode === 'resume'
       ? [
           'exec',
           'resume',
           args.sessionId!,
+          ...imageArgs,
           '--dangerously-bypass-approvals-and-sandbox',
           '--json',
           '-'
@@ -130,6 +143,7 @@ function buildSpawnSpec(args: LauncherArgs): { command: string; args: string[] }
           'exec',
           '--cd',
           args.workspaceRoot,
+          ...imageArgs,
           '--dangerously-bypass-approvals-and-sandbox',
           '--json',
           '-'

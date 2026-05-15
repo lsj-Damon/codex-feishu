@@ -9,6 +9,10 @@ import { HealthReporter } from '../../core/health/reporter.js';
 import type { AppLogger } from '../../core/logger/logger.js';
 import type { DeliveryRecord, JobRecord } from '../../core/types/domain.js';
 import { addMilliseconds, nowIso, sleep } from '../../core/utils/time.js';
+import {
+  buildDownloadedImageAttachment,
+  resolveImageAttachmentPath
+} from '../../domains/attachments/image-cache.js';
 import { MessageAttachmentRepository } from '../../domains/attachments/repository.js';
 import { ConversationRepository } from '../../domains/conversation/repository.js';
 import { generateConversationSummary } from '../../domains/conversation/summary.js';
@@ -373,26 +377,88 @@ export class AssistantWorkerService {
   private buildCodexPrompt(
     projectName: string,
     conversationId: number,
-    latestUserText: string
+    latestUserText: string,
+    options?: {
+      hasImageAttachment?: boolean;
+      imageAttachmentReady?: boolean;
+      imagePreparationWarning?: string | null;
+    }
   ): string {
-    const recentMessages = this.messages.getRecentConversationMessages(
+    const recentMessages = this.buildPromptTranscriptMessages(
       conversationId,
-      Math.max(this.config.worker.maxContextMessages, 6)
+      {
+        hasImageAttachment: options?.hasImageAttachment ?? false,
+        imageAttachmentReady: options?.imageAttachmentReady ?? false
+      }
     );
     const transcript = recentMessages
       .slice(-6)
       .map((message) => `${message.role}: ${message.contentText}`)
       .join('\n');
 
+    const imageContext: string[] = [];
+    if (options?.hasImageAttachment) {
+      if (options?.imageAttachmentReady) {
+        imageContext.push(
+          'The current user message includes a screenshot attachment from Feishu, and the screenshot has already been downloaded successfully and attached to this turn.'
+        );
+        imageContext.push(
+          'Treat the screenshot as available input for this turn. Do not say that the screenshot is missing unless the current turn explicitly says attachment download failed.'
+        );
+      } else {
+        imageContext.push(
+          'The current user message includes a screenshot attachment from Feishu. Inspect the screenshot together with the repository state and the ongoing session context.'
+        );
+      }
+      if (latestUserText.trim() === '[feishu:image]') {
+        imageContext.push(
+          'The screenshot may show runtime output, an error state, or a UI result after a code change. Analyze what the screenshot shows and propose or apply the next code fix.'
+        );
+      }
+    }
+    if (options?.imagePreparationWarning) {
+      imageContext.push(
+        `Screenshot attachment warning: ${options.imagePreparationWarning}`
+      );
+    }
+
     return [
       `You are handling a Feishu conversation for project ${projectName}.`,
       `Working directory is constrained to the selected project under ${this.config.codex.workspaceRoot}.`,
       `Prefer concise, high-signal replies suitable for instant messaging.`,
+      ...(imageContext.length > 0
+        ? [imageContext.join('\n')]
+        : []),
       `Recent conversation context:`,
       transcript || '(none)',
       `Current user request:`,
       latestUserText
     ].join('\n\n');
+  }
+
+  private buildPromptTranscriptMessages(
+    conversationId: number,
+    options: {
+      hasImageAttachment: boolean;
+      imageAttachmentReady: boolean;
+    }
+  ) {
+    const recentMessages = this.messages.getRecentConversationMessages(
+      conversationId,
+      Math.max(this.config.worker.maxContextMessages, 6)
+    );
+
+    if (!options.hasImageAttachment || !options.imageAttachmentReady) {
+      return recentMessages;
+    }
+
+    return recentMessages.filter((message) => {
+      if (message.role !== 'assistant') {
+        return true;
+      }
+
+      return !isHistoricalImageFailureReply(message.contentText);
+    });
   }
 
   private ensureConversationProjectBinding(conversation: {
@@ -766,6 +832,7 @@ export class AssistantWorkerService {
     runId: number;
     completion: CodexRunCompletion;
   }> {
+    const preparedImages = await this.prepareTriggerImages(input.userMessageId);
     const run = this.codexSessionManager.createRun({
       sessionId: input.session.id,
       jobId: input.jobId,
@@ -773,7 +840,12 @@ export class AssistantWorkerService {
       promptText: this.buildCodexPrompt(
         input.projectName,
         input.conversationId,
-        input.latestUserText
+        input.latestUserText,
+        {
+          hasImageAttachment: preparedImages.imagePaths.length > 0,
+          imageAttachmentReady: preparedImages.imageAttachmentReady,
+          imagePreparationWarning: preparedImages.warning
+        }
       )
     });
 
@@ -792,13 +864,15 @@ export class AssistantWorkerService {
           codexSessionId: input.session.codexSessionId,
           promptText: run.promptText,
           outputDir,
-          timeoutMs: this.config.codex.execTimeoutMs
+          timeoutMs: this.config.codex.execTimeoutMs,
+          imagePaths: preparedImages.imagePaths
         })
       : await this.codexClient.runNewSession({
           workspaceRoot: input.projectPath,
           promptText: run.promptText,
           outputDir,
-          timeoutMs: this.config.codex.execTimeoutMs
+          timeoutMs: this.config.codex.execTimeoutMs,
+          imagePaths: preparedImages.imagePaths
         });
 
     try {
@@ -899,6 +973,96 @@ export class AssistantWorkerService {
       lower.includes('epipe')
     );
   }
+
+  private async prepareTriggerImages(messageId: number): Promise<{
+    imagePaths: string[];
+    imageAttachmentReady: boolean;
+    warning: string | null;
+  }> {
+    if (!this.config.worker.imageInputEnabled) {
+      return {
+        imagePaths: [],
+        imageAttachmentReady: false,
+        warning: null
+      };
+    }
+
+    const attachments = this.attachments
+      .listByMessageId(messageId)
+      .filter((attachment) => attachment.attachmentKind === 'image');
+    const firstAttachment = attachments[0];
+    if (!firstAttachment) {
+      return {
+        imagePaths: [],
+        imageAttachmentReady: false,
+        warning: null
+      };
+    }
+
+    const message = this.messages.getById(messageId);
+    if (!message?.platformMessageId) {
+      return {
+        imagePaths: [],
+        imageAttachmentReady: false,
+        warning:
+          'the Feishu screenshot could not be attached (missing platform message id)'
+      };
+    }
+
+    const localPath = resolveImageAttachmentPath(
+      this.config.paths.imageAttachmentsDir,
+      firstAttachment.remoteKey
+    );
+
+    try {
+      if (
+        firstAttachment.status !== 'downloaded' ||
+        !firstAttachment.localPath ||
+        firstAttachment.localPath !== localPath
+      ) {
+        await this.feishuClient.downloadImage(
+          message.platformMessageId,
+          firstAttachment.remoteKey,
+          localPath
+        );
+        const downloaded = buildDownloadedImageAttachment(
+          firstAttachment.remoteKey,
+          localPath
+        );
+        if (!downloaded) {
+          throw new Error('downloaded file is not a supported image');
+        }
+        this.attachments.markDownloaded(
+          firstAttachment.id,
+          localPath,
+          downloaded.mimeType,
+          nowIso()
+        );
+      } else {
+        const downloaded = buildDownloadedImageAttachment(
+          firstAttachment.remoteKey,
+          firstAttachment.localPath
+        );
+        if (!downloaded) {
+          throw new Error('cached image is invalid or unsupported');
+        }
+      }
+
+      return {
+        imagePaths: [localPath],
+        imageAttachmentReady: true,
+        warning: null
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.attachments.markFailed(firstAttachment.id, message, nowIso());
+      return {
+        imagePaths: [],
+        imageAttachmentReady: false,
+        warning: `the Feishu screenshot could not be attached (${message})`
+      };
+    }
+  }
 }
 
 async function runWithTimeout<T>(
@@ -922,4 +1086,18 @@ async function runWithTimeout<T>(
       clearTimeout(timer);
     }
   }
+}
+
+function isHistoricalImageFailureReply(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes('当前还不能直接识别图片内容') ||
+    normalized.includes('截图附件没有成功传到') ||
+    normalized.includes('图片还是没有传到我这边') ||
+    normalized.includes('the feishu screenshot could not be attached') ||
+    normalized.includes('screenshot attachment warning') ||
+    normalized.includes('当前状态是 `400`') ||
+    normalized.includes('附件状态仍像是 `400`') ||
+    normalized.includes('文字消息通') && normalized.includes('图片附件当前不通')
+  );
 }
