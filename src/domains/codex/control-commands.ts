@@ -1,11 +1,12 @@
-import path from 'node:path';
 import { mkdirSync, readdirSync, statSync } from 'node:fs';
+import path from 'node:path';
 
 export type CodexControlCommand =
   | { type: 'list_projects' }
   | { type: 'current_project' }
   | { type: 'switch_project'; projectName: string }
   | { type: 'create_project'; projectName: string }
+  | { type: 'analyze_project' }
   | { type: 'normal_message' };
 
 export interface WorkspaceProjectInfo {
@@ -22,6 +23,10 @@ export function parseCodexControlCommand(text: string): CodexControlCommand {
 
   if (normalized === '当前项目') {
     return { type: 'current_project' };
+  }
+
+  if (normalized === '分析项目') {
+    return { type: 'analyze_project' };
   }
 
   if (normalized.startsWith('切换项目 ')) {
@@ -41,7 +46,9 @@ export function parseCodexControlCommand(text: string): CodexControlCommand {
   return { type: 'normal_message' };
 }
 
-export function listWorkspaceProjects(workspaceRoot: string): WorkspaceProjectInfo[] {
+export function listWorkspaceProjects(
+  workspaceRoot: string
+): WorkspaceProjectInfo[] {
   mkdirSync(workspaceRoot, { recursive: true });
 
   return readdirSync(workspaceRoot, { withFileTypes: true })
@@ -112,7 +119,10 @@ function isSafeProjectName(projectName: string): boolean {
   return !/[\\/]/u.test(projectName) && !projectName.includes('..');
 }
 
-function isFirstLevelProject(workspaceRoot: string, projectPath: string): boolean {
+function isFirstLevelProject(
+  workspaceRoot: string,
+  projectPath: string
+): boolean {
   const resolvedRoot = path.resolve(workspaceRoot);
   const resolvedProject = path.resolve(projectPath);
 

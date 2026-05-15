@@ -163,9 +163,10 @@ export class AssistantWorkerService {
     let currentSessionId: number | null = null;
 
     try {
+      const command = parseCodexControlCommand(triggerMessage.contentText);
       const controlResult = this.tryHandleControlCommand(
         conversation,
-        triggerMessage.contentText
+        command
       );
       if (controlResult) {
         await this.sendLocalReply({
@@ -210,6 +211,10 @@ export class AssistantWorkerService {
       } else {
         const projectBinding =
           this.ensureConversationProjectBinding(conversation);
+        const effectiveUserText = this.resolveCodexUserText(
+          command,
+          triggerMessage.contentText
+        );
         const execution = await this.executeCodexJob({
           conversationId: conversation.id,
           chatId: conversation.chatId,
@@ -218,7 +223,7 @@ export class AssistantWorkerService {
           userMessageId: triggerMessage.id,
           projectName: projectBinding.projectName,
           projectPath: projectBinding.projectPath,
-          latestUserText: triggerMessage.contentText,
+          latestUserText: effectiveUserText,
           logger: jobLogger
         });
         currentSessionId = execution.sessionId;
@@ -585,11 +590,14 @@ export class AssistantWorkerService {
   }
 
   private tryHandleControlCommand(
-    conversation: { id: number; currentProjectName: string | null; currentProjectPath: string | null },
-    messageText: string
+    conversation: {
+      id: number;
+      currentProjectName: string | null;
+      currentProjectPath: string | null;
+    },
+    command: ReturnType<typeof parseCodexControlCommand>
   ): { commandType: string; replyText: string } | null {
-    const command = parseCodexControlCommand(messageText);
-    if (command.type === 'normal_message') {
+    if (command.type === 'normal_message' || command.type === 'analyze_project') {
       return null;
     }
 
@@ -676,6 +684,17 @@ export class AssistantWorkerService {
     }
 
     return null;
+  }
+
+  private resolveCodexUserText(
+    command: ReturnType<typeof parseCodexControlCommand>,
+    fallbackText: string
+  ): string {
+    if (command.type === 'analyze_project') {
+      return '/understand --language zh';
+    }
+
+    return fallbackText;
   }
 
   private async executeCodexJob(input: {

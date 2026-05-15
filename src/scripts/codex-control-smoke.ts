@@ -9,6 +9,7 @@ import { openDatabase } from '../core/db/database.js';
 import { runMigrations } from '../core/db/migrations.js';
 import { HealthReporter } from '../core/health/reporter.js';
 import { AppLogger } from '../core/logger/logger.js';
+import { parseCodexControlCommand } from '../domains/codex/control-commands.js';
 
 async function main(): Promise<void> {
   const runtimeRoot = path.join(process.cwd(), '.runtime', 'codex-control-smoke');
@@ -96,6 +97,9 @@ async function testProjectCommands(runtimeRoot: string): Promise<void> {
     updatedConversation.current_project_path,
     path.join(workspaceRoot, 'gamma')
   );
+
+  const analyze = parseCodexControlCommand('分析项目');
+  assert.equal(analyze.type, 'analyze_project');
 
   database.close();
 }

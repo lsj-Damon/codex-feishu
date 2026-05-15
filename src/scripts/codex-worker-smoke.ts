@@ -18,6 +18,10 @@ async function main(): Promise<void> {
   rmSync(runtimeRoot, { recursive: true, force: true });
   mkdirSync(runtimeRoot, { recursive: true });
 
+  await testAnalyzeProjectAlias(runtimeRoot);
+  rmSync(runtimeRoot, { recursive: true, force: true });
+  mkdirSync(runtimeRoot, { recursive: true });
+
   const workspaceRoot = path.join(runtimeRoot, 'workspace');
   const projectPath = path.join(workspaceRoot, 'alpha');
   mkdirSync(projectPath, { recursive: true });
@@ -145,11 +149,69 @@ async function main(): Promise<void> {
   console.log('Codex worker smoke checks passed.');
 }
 
+async function testAnalyzeProjectAlias(runtimeRoot: string): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace-alias');
+  const projectPath = path.join(workspaceRoot, 'alpha');
+  mkdirSync(projectPath, { recursive: true });
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-worker-smoke-alias',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(
+    database,
+    workspaceRoot,
+    'alpha',
+    projectPath,
+    'chat-codex-worker-alias'
+  );
+  const fakeFeishu = new FakeFeishuMessageClient();
+  const fakeCodex = new AssertingCodexCliClient('/understand --language zh');
+
+  const triggerMessageId = seedUserMessage(database, conversationId, '分析项目');
+  const createdAt = nowIso();
+  database.prepare(`
+    UPDATE conversations
+    SET last_user_message_id = ?, message_count = 1, last_activity_at = ?, updated_at = ?
+    WHERE id = ?
+  `).run(triggerMessageId, createdAt, createdAt, conversationId);
+  database.prepare(`
+    INSERT INTO jobs (
+      job_type, conversation_id, trigger_message_id, status, priority,
+      attempt_count, max_attempts, available_at, locked_by, lease_expires_at,
+      last_error_code, last_error_message, result_message_id, created_at, updated_at
+    ) VALUES ('reply_generation', ?, ?, 'queued', 0, 0, 4, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+  `).run(conversationId, triggerMessageId, createdAt, createdAt, createdAt);
+
+  const worker = new AssistantWorkerService(
+    config,
+    database,
+    logger,
+    fakeFeishu as any,
+    null,
+    new HealthReporter('worker', config.paths.healthFile),
+    fakeCodex
+  );
+
+  const processed = await worker.runSingleIteration();
+  assert.equal(processed, true);
+  fakeCodex.assertExpectedPrompt();
+  assert.equal(fakeFeishu.sent.length >= 2, true);
+
+  database.close();
+}
+
 function seedConversation(
   database: ReturnType<typeof openDatabase>,
   workspaceRoot: string,
   projectName: string,
-  projectPath: string
+  projectPath: string,
+  conversationKey = 'chat-codex-worker'
 ): number {
   const createdAt = nowIso();
   database.prepare(`
@@ -157,15 +219,24 @@ function seedConversation(
       platform, conversation_key, chat_id, chat_type, user_open_id, status,
       workspace_root, current_project_name, current_project_path, active_backend,
       message_count, last_activity_at, created_at, updated_at
-    ) VALUES ('feishu', 'chat-codex-worker', 'chat-codex-worker', 'p2p', 'user-1', 'active',
+    ) VALUES ('feishu', ?, ?, 'p2p', 'user-1', 'active',
       ?, ?, ?, 'codex', 0, ?, ?, ?)
-  `).run(workspaceRoot, projectName, projectPath, createdAt, createdAt, createdAt);
+  `).run(
+    conversationKey,
+    conversationKey,
+    workspaceRoot,
+    projectName,
+    projectPath,
+    createdAt,
+    createdAt,
+    createdAt
+  );
 
   return Number(
     (
       database
-        .prepare(`SELECT id FROM conversations WHERE conversation_key = 'chat-codex-worker'`)
-        .get() as { id: number }
+        .prepare(`SELECT id FROM conversations WHERE conversation_key = ?`)
+        .get(conversationKey) as { id: number }
     ).id
   );
 }
@@ -296,6 +367,53 @@ class FakeFeishuMessageClient {
       platformMessageId: `reply-${this.sent.length}`,
       raw: {}
     };
+  }
+}
+
+class AssertingCodexCliClient extends FakeCodexCliClient {
+  private readonly expectedPromptText: string;
+  public seenPromptText: string | null = null;
+
+  public constructor(expectedPromptText: string) {
+    const runtimeRoot = path.join(process.cwd(), '.runtime');
+    super([
+      {
+        sessionId: 'thread-analyze-project',
+        events: [
+          { type: 'thread.started', thread_id: 'thread-analyze-project' },
+          { type: 'turn.started' },
+          createProgressMessageEvent('Running project understanding'),
+          {
+            type: 'item.completed',
+            item: {
+              type: 'agent_message',
+              text: 'Project understanding complete.'
+            }
+          }
+        ],
+        completion: {
+          exitCode: 0,
+          finalMessageText: 'Project understanding complete.',
+          jsonlPath: path.join(runtimeRoot, 'worker-alias.jsonl'),
+          stderrPath: path.join(runtimeRoot, 'worker-alias.stderr')
+        }
+      }
+    ]);
+    this.expectedPromptText = expectedPromptText;
+  }
+
+  public override async runNewSession(input: {
+    workspaceRoot: string;
+    promptText: string;
+    outputDir: string;
+    timeoutMs: number;
+  }) {
+    this.seenPromptText = input.promptText;
+    return super.runNewSession(input);
+  }
+
+  public assertExpectedPrompt(): void {
+    assert.match(this.seenPromptText ?? '', new RegExp(this.expectedPromptText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
 }
 
