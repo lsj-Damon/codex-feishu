@@ -16,7 +16,7 @@ export type DeliveryStatus =
   | 'succeeded'
   | 'failed';
 export type JobAttemptOutcome = 'succeeded' | 'retry_scheduled' | 'failed';
-export type AttachmentStatus = 'pending' | 'downloaded' | 'failed';
+export type AttachmentStatus = 'pending' | 'downloaded' | 'failed' | 'skipped';
 export type AttachmentKind = 'image';
 export type ExecutionBackend = 'openai' | 'codex';
 export type CodexSessionStatus =

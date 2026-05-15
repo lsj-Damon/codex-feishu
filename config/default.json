@@ -32,7 +32,8 @@
     "summaryRefreshInterval": 4,
     "maxAttempts": 4,
     "retryBaseMs": 3000,
-    "retryMaxDelayMs": 300000
+    "retryMaxDelayMs": 300000,
+    "maxImagesPerMessage": 9
   },
   "maintenance": {
     "backupKeepCount": 5,

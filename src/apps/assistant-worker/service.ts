@@ -381,6 +381,10 @@ export class AssistantWorkerService {
     options?: {
       hasImageAttachment?: boolean;
       imageAttachmentReady?: boolean;
+      attachedImageCount?: number;
+      totalImageCount?: number;
+      failedImageCount?: number;
+      skippedImageCount?: number;
       imagePreparationWarning?: string | null;
     }
   ): string {
@@ -398,21 +402,36 @@ export class AssistantWorkerService {
 
     const imageContext: string[] = [];
     if (options?.hasImageAttachment) {
+      const attachedCount = options.attachedImageCount ?? 0;
+      const totalImageCount = options.totalImageCount ?? attachedCount;
+      const failedImageCount = options.failedImageCount ?? 0;
+      const skippedImageCount = options.skippedImageCount ?? 0;
+
       if (options?.imageAttachmentReady) {
+        if (
+          failedImageCount === 0 &&
+          skippedImageCount === 0 &&
+          attachedCount === totalImageCount
+        ) {
+          imageContext.push(
+            `The current user message includes ${attachedCount} screenshot attachment${attachedCount === 1 ? '' : 's'} from Feishu, and all ${attachedCount} screenshot attachment${attachedCount === 1 ? '' : 's'} have been downloaded successfully and attached to this turn in the original attachment order.`
+          );
+        } else {
+          imageContext.push(
+            `The current user message includes ${totalImageCount} screenshot attachment${totalImageCount === 1 ? '' : 's'} from Feishu. ${attachedCount} screenshot attachment${attachedCount === 1 ? '' : 's'} were attached successfully${failedImageCount > 0 ? `, ${failedImageCount} failed to attach` : ''}${skippedImageCount > 0 ? `, and ${skippedImageCount} were skipped by policy` : ''}. Analyze the available screenshots in their original attachment order.`
+          );
+        }
         imageContext.push(
-          'The current user message includes a screenshot attachment from Feishu, and the screenshot has already been downloaded successfully and attached to this turn.'
-        );
-        imageContext.push(
-          'Treat the screenshot as available input for this turn. Do not say that the screenshot is missing unless the current turn explicitly says attachment download failed.'
+          'Treat the attached screenshots as available input for this turn. Do not say that the screenshots are missing unless the current turn explicitly says attachment download failed.'
         );
       } else {
         imageContext.push(
-          'The current user message includes a screenshot attachment from Feishu. Inspect the screenshot together with the repository state and the ongoing session context.'
+          `The current user message includes ${totalImageCount} screenshot attachment${totalImageCount === 1 ? '' : 's'} from Feishu. Inspect the screenshots together with the repository state and the ongoing session context if any attachment becomes available.`
         );
       }
       if (latestUserText.trim() === '[feishu:image]') {
         imageContext.push(
-          'The screenshot may show runtime output, an error state, or a UI result after a code change. Analyze what the screenshot shows and propose or apply the next code fix.'
+          'The screenshots may show different runtime outputs, before-and-after states, multiple related errors, or UI results after a code change. Analyze what the screenshots show as a set and propose or apply the next code fix.'
         );
       }
     }
@@ -832,7 +851,21 @@ export class AssistantWorkerService {
     runId: number;
     completion: CodexRunCompletion;
   }> {
-    const preparedImages = await this.prepareTriggerImages(input.userMessageId);
+    const preparedImages = await this.prepareTriggerImages(
+      input.userMessageId,
+      input.logger
+    );
+    input.logger.info('prepared trigger images summary', {
+      session_id: input.session.id,
+      user_message_id: input.userMessageId,
+      total_image_count: preparedImages.totalImageCount,
+      attached_image_count: preparedImages.attachedImageCount,
+      failed_image_count: preparedImages.failedImageCount,
+      skipped_image_count: preparedImages.skippedImageCount,
+      image_paths: preparedImages.imagePaths,
+      image_attachment_ready: preparedImages.imageAttachmentReady,
+      warning: preparedImages.warning
+    });
     const run = this.codexSessionManager.createRun({
       sessionId: input.session.id,
       jobId: input.jobId,
@@ -842,8 +875,12 @@ export class AssistantWorkerService {
         input.conversationId,
         input.latestUserText,
         {
-          hasImageAttachment: preparedImages.imagePaths.length > 0,
+          hasImageAttachment: preparedImages.totalImageCount > 0,
           imageAttachmentReady: preparedImages.imageAttachmentReady,
+          attachedImageCount: preparedImages.attachedImageCount,
+          totalImageCount: preparedImages.totalImageCount,
+          failedImageCount: preparedImages.failedImageCount,
+          skippedImageCount: preparedImages.skippedImageCount,
           imagePreparationWarning: preparedImages.warning
         }
       )
@@ -974,27 +1011,53 @@ export class AssistantWorkerService {
     );
   }
 
-  private async prepareTriggerImages(messageId: number): Promise<{
+  private async prepareTriggerImages(
+    messageId: number,
+    logger?: AppLogger
+  ): Promise<{
     imagePaths: string[];
     imageAttachmentReady: boolean;
+    totalImageCount: number;
+    attachedImageCount: number;
+    failedImageCount: number;
+    skippedImageCount: number;
     warning: string | null;
   }> {
     if (!this.config.worker.imageInputEnabled) {
       return {
         imagePaths: [],
         imageAttachmentReady: false,
+        totalImageCount: 0,
+        attachedImageCount: 0,
+        failedImageCount: 0,
+        skippedImageCount: 0,
         warning: null
       };
     }
 
     const attachments = this.attachments
       .listByMessageId(messageId)
-      .filter((attachment) => attachment.attachmentKind === 'image');
-    const firstAttachment = attachments[0];
-    if (!firstAttachment) {
+      .filter((attachment) => attachment.attachmentKind === 'image')
+      .sort((left, right) => left.attachmentIndex - right.attachmentIndex);
+    logger?.info('loaded trigger image attachments', {
+      message_id: messageId,
+      total_image_count: attachments.length,
+      attachments: attachments.map((attachment) => ({
+        attachment_id: attachment.id,
+        attachment_index: attachment.attachmentIndex,
+        remote_key: attachment.remoteKey,
+        status: attachment.status,
+        local_path: attachment.localPath
+      }))
+    });
+    if (attachments.length === 0) {
       return {
         imagePaths: [],
         imageAttachmentReady: false,
+        totalImageCount: 0,
+        attachedImageCount: 0,
+        failedImageCount: 0,
+        skippedImageCount: 0,
         warning: null
       };
     }
@@ -1004,64 +1067,155 @@ export class AssistantWorkerService {
       return {
         imagePaths: [],
         imageAttachmentReady: false,
+        totalImageCount: attachments.length,
+        attachedImageCount: 0,
+        failedImageCount: attachments.length,
+        skippedImageCount: 0,
         warning:
-          'the Feishu screenshot could not be attached (missing platform message id)'
+          'the Feishu screenshots could not be attached (missing platform message id)'
       };
     }
 
-    const localPath = resolveImageAttachmentPath(
-      this.config.paths.imageAttachmentsDir,
-      firstAttachment.remoteKey
-    );
+    const maxImages = Math.max(1, this.config.worker.maxImagesPerMessage);
+    const selectedAttachments = attachments.slice(0, maxImages);
+    const overflowAttachments = attachments.slice(maxImages);
+    logger?.info('selected trigger image attachments', {
+      message_id: messageId,
+      max_images_per_message: maxImages,
+      selected_count: selectedAttachments.length,
+      overflow_count: overflowAttachments.length,
+      selected_indexes: selectedAttachments.map(
+        (attachment) => attachment.attachmentIndex
+      ),
+      overflow_indexes: overflowAttachments.map(
+        (attachment) => attachment.attachmentIndex
+      )
+    });
+    const imagePaths: string[] = [];
+    let failedCount = 0;
 
-    try {
-      if (
-        firstAttachment.status !== 'downloaded' ||
-        !firstAttachment.localPath ||
-        firstAttachment.localPath !== localPath
-      ) {
-        await this.feishuClient.downloadImage(
-          message.platformMessageId,
-          firstAttachment.remoteKey,
-          localPath
-        );
-        const downloaded = buildDownloadedImageAttachment(
-          firstAttachment.remoteKey,
-          localPath
-        );
-        if (!downloaded) {
-          throw new Error('downloaded file is not a supported image');
+    for (const attachment of overflowAttachments) {
+      logger?.info('marking overflow trigger image attachment as skipped', {
+        message_id: messageId,
+        attachment_id: attachment.id,
+        attachment_index: attachment.attachmentIndex,
+        remote_key: attachment.remoteKey
+      });
+      this.attachments.markSkipped(
+        attachment.id,
+        'skipped_by_policy:max_images_exceeded',
+        nowIso()
+      );
+    }
+
+    for (const attachment of selectedAttachments) {
+      const localPath = resolveImageAttachmentPath(
+        this.config.paths.imageAttachmentsDir,
+        attachment.remoteKey
+      );
+      logger?.info('processing trigger image attachment', {
+        message_id: messageId,
+        attachment_id: attachment.id,
+        attachment_index: attachment.attachmentIndex,
+        remote_key: attachment.remoteKey,
+        prior_status: attachment.status,
+        cached_local_path: attachment.localPath,
+        target_local_path: localPath
+      });
+
+      try {
+        if (
+          attachment.status !== 'downloaded' ||
+          !attachment.localPath ||
+          attachment.localPath !== localPath
+        ) {
+          await this.feishuClient.downloadImage(
+            message.platformMessageId,
+            attachment.remoteKey,
+            localPath
+          );
+          const downloaded = buildDownloadedImageAttachment(
+            attachment.remoteKey,
+            localPath
+          );
+          if (!downloaded) {
+            throw new Error('downloaded file is not a supported image');
+          }
+          this.attachments.markDownloaded(
+            attachment.id,
+            localPath,
+            downloaded.mimeType,
+            nowIso()
+          );
+        } else {
+          const downloaded = buildDownloadedImageAttachment(
+            attachment.remoteKey,
+            attachment.localPath
+          );
+          if (!downloaded) {
+            throw new Error('cached image is invalid or unsupported');
+          }
         }
-        this.attachments.markDownloaded(
-          firstAttachment.id,
-          localPath,
-          downloaded.mimeType,
-          nowIso()
-        );
-      } else {
-        const downloaded = buildDownloadedImageAttachment(
-          firstAttachment.remoteKey,
-          firstAttachment.localPath
-        );
-        if (!downloaded) {
-          throw new Error('cached image is invalid or unsupported');
-        }
+
+        imagePaths.push(localPath);
+        logger?.info('prepared trigger image attachment successfully', {
+          message_id: messageId,
+          attachment_id: attachment.id,
+          attachment_index: attachment.attachmentIndex,
+          remote_key: attachment.remoteKey,
+          local_path: localPath
+        });
+      } catch (error) {
+        const attachmentError =
+          error instanceof Error ? error.message : String(error);
+        this.attachments.markFailed(attachment.id, attachmentError, nowIso());
+        failedCount += 1;
+        logger?.warn('failed to prepare trigger image attachment', {
+          message_id: messageId,
+          attachment_id: attachment.id,
+          attachment_index: attachment.attachmentIndex,
+          remote_key: attachment.remoteKey,
+          error_message: attachmentError
+        });
       }
-
-      return {
-        imagePaths: [localPath],
-        imageAttachmentReady: true,
-        warning: null
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.attachments.markFailed(firstAttachment.id, message, nowIso());
-      return {
-        imagePaths: [],
-        imageAttachmentReady: false,
-        warning: `the Feishu screenshot could not be attached (${message})`
-      };
     }
+
+    const skippedCount = overflowAttachments.length;
+    const attachedCount = imagePaths.length;
+    const warningParts: string[] = [];
+
+    if (failedCount > 0) {
+      warningParts.push(
+        `${selectedAttachments.length} screenshot attachment${selectedAttachments.length === 1 ? '' : 's'} were selected, ${attachedCount} attached successfully, and ${failedCount} failed to attach`
+      );
+    }
+
+    if (skippedCount > 0) {
+      warningParts.push(
+        `${skippedCount} additional screenshot attachment${skippedCount === 1 ? '' : 's'} were skipped because only the first ${maxImages} attachments are sent to Codex`
+      );
+    }
+
+    logger?.info('completed trigger image preparation', {
+      message_id: messageId,
+      total_image_count: attachments.length,
+      selected_count: selectedAttachments.length,
+      attached_count: attachedCount,
+      failed_count: failedCount,
+      skipped_count: skippedCount,
+      image_paths: imagePaths,
+      warning: warningParts.length > 0 ? warningParts.join('; ') : null
+    });
+
+    return {
+      imagePaths,
+      imageAttachmentReady: imagePaths.length > 0,
+      totalImageCount: attachments.length,
+      attachedImageCount: attachedCount,
+      failedImageCount: failedCount,
+      skippedImageCount: skippedCount,
+      warning: warningParts.length > 0 ? warningParts.join('; ') : null
+    };
   }
 }
 

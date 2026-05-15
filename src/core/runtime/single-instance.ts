@@ -1,4 +1,4 @@
-import { openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 
 import type { AppLogger } from '../logger/logger.js';
 
@@ -13,14 +13,18 @@ export function acquireSingleInstance(
 ): InstanceLock {
   try {
     const fd = openSync(lockFile, 'wx');
-    writeFileSync(
-      fd,
-      JSON.stringify({
-        pid: process.pid,
-        startedAt: new Date().toISOString()
-      }),
-      'utf8'
-    );
+    try {
+      writeFileSync(
+        fd,
+        JSON.stringify({
+          pid: process.pid,
+          startedAt: new Date().toISOString()
+        }),
+        'utf8'
+      );
+    } finally {
+      closeSync(fd);
+    }
     return {
       lockFile,
       release: () => {

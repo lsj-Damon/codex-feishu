@@ -24,6 +24,12 @@ async function main(): Promise<void> {
   await testResumeSessionWithImage(runtimeRoot);
   rmSync(runtimeRoot, { recursive: true, force: true });
   mkdirSync(runtimeRoot, { recursive: true });
+  await testResumeSessionWithMultipleImages(runtimeRoot);
+  rmSync(runtimeRoot, { recursive: true, force: true });
+  mkdirSync(runtimeRoot, { recursive: true });
+  await testImageSelectionCappedAtNine(runtimeRoot);
+  rmSync(runtimeRoot, { recursive: true, force: true });
+  mkdirSync(runtimeRoot, { recursive: true });
 
   const workspaceRoot = path.join(runtimeRoot, 'workspace');
   const projectPath = path.join(workspaceRoot, 'alpha');
@@ -347,7 +353,8 @@ function createTestConfig(runtimeRoot: string, workspaceRoot: string): AppConfig
       maxAttempts: 4,
       retryBaseMs: 0,
       retryMaxDelayMs: 0,
-      imageInputEnabled: true
+      imageInputEnabled: true,
+      maxImagesPerMessage: 9
     },
     maintenance: {
       backupKeepCount: 5,
@@ -551,6 +558,245 @@ async function testResumeSessionWithImage(runtimeRoot: string): Promise<void> {
   database.close();
 }
 
+async function testResumeSessionWithMultipleImages(
+  runtimeRoot: string
+): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace-multi');
+  const projectPath = path.join(workspaceRoot, 'alpha');
+  mkdirSync(projectPath, { recursive: true });
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-worker-smoke-multi',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(
+    database,
+    workspaceRoot,
+    'alpha',
+    projectPath,
+    'chat-codex-worker-multi'
+  );
+  const sessionId = seedHealthyResumeSession(
+    database,
+    conversationId,
+    projectPath,
+    'thread-image-multi'
+  );
+  const triggerMessageId = seedUserMessage(
+    database,
+    conversationId,
+    '[feishu:image]'
+  );
+  seedImageAttachment(database, triggerMessageId, 'img_multi_1', 0);
+  seedImageAttachment(database, triggerMessageId, 'img_multi_2', 1);
+  seedImageAttachment(database, triggerMessageId, 'img_multi_3', 2);
+  const createdAt = nowIso();
+  database.prepare(`
+    UPDATE conversations
+    SET last_user_message_id = ?, message_count = 1, last_activity_at = ?, updated_at = ?, active_session_id = ?
+    WHERE id = ?
+  `).run(triggerMessageId, createdAt, createdAt, sessionId, conversationId);
+  database.prepare(`
+    INSERT INTO jobs (
+      job_type, conversation_id, trigger_message_id, status, priority,
+      attempt_count, max_attempts, available_at, locked_by, lease_expires_at,
+      last_error_code, last_error_message, result_message_id, created_at, updated_at
+    ) VALUES ('reply_generation', ?, ?, 'queued', 0, 0, 4, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+  `).run(conversationId, triggerMessageId, createdAt, createdAt, createdAt);
+
+  const fakeFeishu = new FakeFeishuMessageClient();
+  const fakeCodex = new FakeCodexCliClient([
+    {
+      sessionId: 'thread-image-multi',
+      events: [
+        { type: 'turn.started' },
+        createProgressMessageEvent('Reviewing attached screenshots'),
+        {
+          type: 'item.completed',
+          item: {
+            type: 'agent_message',
+            text: 'I compared the screenshots and identified the regression window.'
+          }
+        }
+      ],
+      completion: {
+        exitCode: 0,
+        finalMessageText:
+          'I compared the screenshots and identified the regression window.',
+        jsonlPath: path.join(runtimeRoot, 'resume-multi.jsonl'),
+        stderrPath: path.join(runtimeRoot, 'resume-multi.stderr')
+      }
+    }
+  ]);
+  const worker = new AssistantWorkerService(
+    config,
+    database,
+    logger,
+    fakeFeishu as any,
+    null,
+    new HealthReporter('worker', config.paths.healthFile),
+    fakeCodex
+  );
+
+  const processed = await worker.runSingleIteration();
+  assert.equal(processed, true);
+  assert.equal(fakeFeishu.downloadCalls, 3);
+  assert.equal(fakeCodex.resumeSessionInputs.length, 1);
+  assert.equal(fakeCodex.resumeSessionInputs[0]?.imagePaths?.length, 3);
+  assert.deepEqual(
+    fakeCodex.resumeSessionInputs[0]?.imagePaths?.map((value) =>
+      path.basename(value)
+    ),
+    ['img_multi_1.bin', 'img_multi_2.bin', 'img_multi_3.bin']
+  );
+  assert.match(
+    fakeCodex.resumeSessionInputs[0]?.promptText ?? '',
+    /includes 3 screenshot attachments from Feishu/i
+  );
+  assert.match(
+    fakeCodex.resumeSessionInputs[0]?.promptText ?? '',
+    /all 3 screenshot attachments have been downloaded successfully/i
+  );
+
+  const attachmentRows = database.prepare(`
+    SELECT attachment_index, status
+    FROM message_attachments
+    WHERE message_id = ?
+    ORDER BY attachment_index ASC
+  `).all(triggerMessageId) as Array<{
+    attachment_index: number;
+    status: string;
+  }>;
+  assert.deepEqual(
+    attachmentRows.map((row) => row.status),
+    ['downloaded', 'downloaded', 'downloaded']
+  );
+
+  database.close();
+}
+
+async function testImageSelectionCappedAtNine(
+  runtimeRoot: string
+): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace-cap');
+  const projectPath = path.join(workspaceRoot, 'alpha');
+  mkdirSync(projectPath, { recursive: true });
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-worker-smoke-cap',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(
+    database,
+    workspaceRoot,
+    'alpha',
+    projectPath,
+    'chat-codex-worker-cap'
+  );
+  const triggerMessageId = seedUserMessage(
+    database,
+    conversationId,
+    'Please compare these screenshots.'
+  );
+  for (let index = 0; index < 12; index += 1) {
+    seedImageAttachment(database, triggerMessageId, `img_cap_${index + 1}`, index);
+  }
+  const createdAt = nowIso();
+  database.prepare(`
+    UPDATE conversations
+    SET last_user_message_id = ?, message_count = 1, last_activity_at = ?, updated_at = ?
+    WHERE id = ?
+  `).run(triggerMessageId, createdAt, createdAt, conversationId);
+  database.prepare(`
+    INSERT INTO jobs (
+      job_type, conversation_id, trigger_message_id, status, priority,
+      attempt_count, max_attempts, available_at, locked_by, lease_expires_at,
+      last_error_code, last_error_message, result_message_id, created_at, updated_at
+    ) VALUES ('reply_generation', ?, ?, 'queued', 0, 0, 4, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+  `).run(conversationId, triggerMessageId, createdAt, createdAt, createdAt);
+
+  const fakeFeishu = new FakeFeishuMessageClient();
+  const fakeCodex = new FakeCodexCliClient([
+    {
+      sessionId: 'thread-image-cap',
+      events: [
+        { type: 'thread.started', thread_id: 'thread-image-cap' },
+        { type: 'turn.started' },
+        createProgressMessageEvent('Comparing the first nine screenshots'),
+        {
+          type: 'item.completed',
+          item: {
+            type: 'agent_message',
+            text: 'I used the first nine screenshots and ignored the overflow attachments.'
+          }
+        }
+      ],
+      completion: {
+        exitCode: 0,
+        finalMessageText:
+          'I used the first nine screenshots and ignored the overflow attachments.',
+        jsonlPath: path.join(runtimeRoot, 'cap-nine.jsonl'),
+        stderrPath: path.join(runtimeRoot, 'cap-nine.stderr')
+      }
+    }
+  ]);
+  const worker = new AssistantWorkerService(
+    config,
+    database,
+    logger,
+    fakeFeishu as any,
+    null,
+    new HealthReporter('worker', config.paths.healthFile),
+    fakeCodex
+  );
+
+  const processed = await worker.runSingleIteration();
+  assert.equal(processed, true);
+  assert.equal(fakeFeishu.downloadCalls, 9);
+  assert.equal(fakeCodex.runNewSessionInputs.length, 1);
+  assert.equal(fakeCodex.runNewSessionInputs[0]?.imagePaths?.length, 9);
+  assert.match(
+    fakeCodex.runNewSessionInputs[0]?.promptText ?? '',
+    /only the first 9 attachments are sent to Codex/i
+  );
+
+  const attachmentRows = database.prepare(`
+    SELECT attachment_index, status, last_error_message
+    FROM message_attachments
+    WHERE message_id = ?
+    ORDER BY attachment_index ASC
+  `).all(triggerMessageId) as Array<{
+    attachment_index: number;
+    status: string;
+    last_error_message: string | null;
+  }>;
+  assert.equal(attachmentRows.length, 12);
+  assert.deepEqual(
+    attachmentRows.slice(0, 9).map((row) => row.status),
+    new Array(9).fill('downloaded')
+  );
+  assert.deepEqual(
+    attachmentRows.slice(9).map((row) => row.status),
+    ['skipped', 'skipped', 'skipped']
+  );
+  assert.deepEqual(
+    attachmentRows.slice(9).map((row) => row.last_error_message),
+    new Array(3).fill('skipped_by_policy:max_images_exceeded')
+  );
+
+  database.close();
+}
+
 function seedHealthyResumeSession(
   database: ReturnType<typeof openDatabase>,
   conversationId: number,
@@ -577,7 +823,8 @@ function seedHealthyResumeSession(
 function seedImageAttachment(
   database: ReturnType<typeof openDatabase>,
   messageId: number,
-  remoteKey: string
+  remoteKey: string,
+  attachmentIndex = 0
 ): void {
   const createdAt = nowIso();
   database.prepare(`
@@ -585,9 +832,10 @@ function seedImageAttachment(
       message_id, attachment_index, provider, attachment_kind, remote_key,
       local_path, mime_type, status, width, height, metadata_json,
       last_error_message, created_at, updated_at
-    ) VALUES (?, 0, 'feishu', 'image', ?, NULL, NULL, 'pending', NULL, NULL, ?, NULL, ?, ?)
+    ) VALUES (?, ?, 'feishu', 'image', ?, NULL, NULL, 'pending', NULL, NULL, ?, NULL, ?, ?)
   `).run(
     messageId,
+    attachmentIndex,
     remoteKey,
     JSON.stringify({ image_key: remoteKey }),
     createdAt,

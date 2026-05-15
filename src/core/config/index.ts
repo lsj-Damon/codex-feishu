@@ -66,6 +66,7 @@ export interface AppConfig {
     retryBaseMs: number;
     retryMaxDelayMs: number;
     imageInputEnabled: boolean;
+    maxImagesPerMessage: number;
   };
   maintenance: {
     backupKeepCount: number;
@@ -113,6 +114,7 @@ type FileConfigOverrides = {
     maxAttempts?: number;
     retryBaseMs?: number;
     retryMaxDelayMs?: number;
+    maxImagesPerMessage?: number;
   };
   maintenance?: {
     backupKeepCount?: number;
@@ -298,6 +300,11 @@ export function loadAppConfig(role: AppRole): AppConfig {
         'WORKER_IMAGE_INPUT_ENABLED',
         undefined,
         true
+      ),
+      maxImagesPerMessage: parseIntegerConfig(
+        'WORKER_MAX_IMAGES_PER_MESSAGE',
+        fileConfig.worker?.maxImagesPerMessage,
+        9
       )
     },
     maintenance: {

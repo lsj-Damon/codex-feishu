@@ -99,6 +99,22 @@ export class MessageAttachmentRepository {
       `)
       .run(errorMessage, updatedAt, attachmentId);
   }
+
+  public markSkipped(
+    attachmentId: number,
+    reason: string,
+    updatedAt: string
+  ): void {
+    this.database
+      .prepare(`
+        UPDATE message_attachments
+        SET status = 'skipped',
+            last_error_message = ?,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(reason, updatedAt, attachmentId);
+  }
 }
 
 function mapAttachmentRow(row: Record<string, unknown>): MessageAttachmentRecord {

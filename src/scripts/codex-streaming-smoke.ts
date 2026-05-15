@@ -255,7 +255,8 @@ function createTestConfig(runtimeRoot: string): AppConfig {
       maxAttempts: 4,
       retryBaseMs: 0,
       retryMaxDelayMs: 0,
-      imageInputEnabled: true
+      imageInputEnabled: true,
+      maxImagesPerMessage: 9
     },
     maintenance: {
       backupKeepCount: 5,

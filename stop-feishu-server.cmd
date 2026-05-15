@@ -1,11 +1,10 @@
 @echo off
 setlocal
 
-echo [INFO] Stopping Feishu Gateway...
-taskkill /FI "WINDOWTITLE eq Feishu Gateway" /T /F >nul 2>nul
+pushd "%~dp0"
 
-echo [INFO] Stopping Feishu Worker...
-taskkill /FI "WINDOWTITLE eq Feishu Worker" /T /F >nul 2>nul
+echo [INFO] Stopping managed Feishu gateway/worker processes...
+powershell.exe -ExecutionPolicy Bypass -File "%~dp0scripts\manage-service-processes.ps1" -Mode stop
 
 echo.
 echo [OK] Stop commands issued.

@@ -26,6 +26,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo [INFO] Stopping existing managed gateway/worker processes...
+powershell.exe -ExecutionPolicy Bypass -File "%~dp0scripts\manage-service-processes.ps1" -Mode stop
+
 echo [INFO] Starting gateway window...
 start "Feishu Gateway" "%ComSpec%" /k call "%~dp0scripts\start-gateway.cmd"
 
