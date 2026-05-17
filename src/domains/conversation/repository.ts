@@ -170,6 +170,23 @@ export class ConversationRepository {
         conversationId
       );
   }
+
+  public clearProjectBinding(
+    conversationId: number,
+    updatedAt: string
+  ): void {
+    this.database
+      .prepare(`
+        UPDATE conversations
+        SET current_project_name = NULL,
+            current_project_path = NULL,
+            active_session_id = NULL,
+            active_backend = 'codex',
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(updatedAt, conversationId);
+  }
 }
 
 function mapConversationRow(row: Record<string, unknown>): ConversationRecord {

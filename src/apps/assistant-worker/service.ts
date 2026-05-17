@@ -19,6 +19,9 @@ import { generateConversationSummary } from '../../domains/conversation/summary.
 import { RealCodexCliClient } from '../../domains/codex/client.js';
 import {
   createWorkspaceProject,
+  inspectWorkspaceProject,
+  describeWorkspaceContainerProject,
+  isRunnableProjectPath,
   listWorkspaceProjects,
   parseCodexControlCommand,
   resolveWorkspaceProject
@@ -200,6 +203,168 @@ export class AssistantWorkerService {
         return true;
       }
 
+      if (command.type === 'compact_context') {
+        const projectBinding = this.ensureConversationProjectBinding(conversation);
+        if ('errorReplyText' in projectBinding) {
+          await this.sendLocalReply({
+            conversationId: conversation.id,
+            chatId: conversation.chatId,
+            replyToMessageId: triggerMessage.platformMessageId,
+            jobId: job.id,
+            replyText: projectBinding.errorReplyText,
+            metadata: {
+              source: 'local_control_command',
+              command: 'compact_context',
+              reason: 'unrunnable_project'
+            }
+          }, jobLogger);
+
+          this.state.processedJobs += 1;
+          this.state.lastSuccessAt = nowIso();
+          this.jobAttempts.finishAttempt({
+            attemptId,
+            outcome: 'succeeded',
+            finishedAt: nowIso(),
+            feishuSendStatus: 'sent'
+          });
+          jobLogger.info('compact context command rejected locally', {
+            reason: 'unrunnable_project'
+          });
+          this.writeHealth('running');
+          return true;
+        }
+        const compactSession = this.codexSessionManager.ensureSessionForProject({
+          conversationId: conversation.id,
+          workspaceRoot: this.config.codex.workspaceRoot,
+          projectName: projectBinding.projectName,
+          projectPath: projectBinding.projectPath
+        });
+        const compactRun = this.codexSessionManager.createRun({
+          sessionId: compactSession.id,
+          jobId: job.id,
+          userMessageId: triggerMessage.id,
+          promptText: '/compact'
+        });
+        this.codexSessionManager.markSessionBusy(compactSession.id);
+        this.codexSessionManager.markRunRunning(compactRun.id);
+
+        const outputDir = path.join(
+          this.config.runtimeRoot,
+          'runs',
+          'codex',
+          `run-${compactRun.id}`
+        );
+        const handle = compactSession.codexSessionId
+          ? await this.codexClient.resumeSession({
+              workspaceRoot: projectBinding.projectPath,
+              codexSessionId: compactSession.codexSessionId,
+              promptText: compactRun.promptText,
+              outputDir,
+              timeoutMs: this.config.codex.execTimeoutMs,
+              imagePaths: []
+            })
+          : await this.codexClient.runNewSession({
+              workspaceRoot: projectBinding.projectPath,
+              promptText: compactRun.promptText,
+              outputDir,
+              timeoutMs: this.config.codex.execTimeoutMs,
+              imagePaths: []
+            });
+
+        const compactCompletion = await runWithTimeout(
+          consumeCodexRunStream({
+            handle,
+            runId: compactRun.id,
+            sessionManager: this.codexSessionManager,
+            sink: {
+              sendProgress: async (text) => {
+                const response = await this.feishuClient.replyText({
+                  chatId: conversation.chatId,
+                  replyToMessageId: triggerMessage.platformMessageId,
+                  text
+                });
+                return response.platformMessageId;
+              },
+              sendFinal: async () => null
+            },
+            progressIntervalMs:
+              this.config.codex.maxProgressMessageIntervalMs,
+            onWarning: (warning) => {
+              jobLogger.warn(warning, {
+                run_id: compactRun.id,
+                session_id: compactSession.id
+              });
+            },
+            onProgressDelivered: (info) => {
+              jobLogger.info('progress delivered to feishu', {
+                run_id: info.runId,
+                event_type: info.eventType,
+                category: info.category,
+                feishu_message_id: info.feishuMessageId,
+                text_preview: info.text.slice(0, 120)
+              });
+            }
+          }),
+          this.config.codex.execTimeoutMs,
+          async () => {
+            await handle.cancel();
+          }
+        );
+        this.codexSessionManager.setCodexSessionId(
+          compactSession.id,
+          compactCompletion.codexSessionId
+        );
+        this.codexSessionManager.completeRun(compactRun.id, {
+          status: compactCompletion.exitCode === 0 ? 'succeeded' : 'failed',
+          exitCode: compactCompletion.exitCode,
+          jsonlPath: compactCompletion.jsonlPath,
+          stderrPath: compactCompletion.stderrPath,
+          finalReplyText: compactCompletion.finalMessageText
+        });
+        this.codexSessionManager.markSessionActive(compactSession.id);
+
+        currentSessionId = compactSession.id;
+        codexCompletion = compactCompletion;
+        const compactReplyText = normalizeCompactReplyText(
+          codexCompletion.finalMessageText
+        );
+
+        await this.sendLocalReply({
+          conversationId: conversation.id,
+          chatId: conversation.chatId,
+          replyToMessageId: triggerMessage.platformMessageId,
+          jobId: job.id,
+          replyText: compactReplyText,
+          metadata: {
+            source: 'codex_compact',
+            sessionId: compactSession.id,
+            codexSessionId: codexCompletion.codexSessionId,
+            projectName: projectBinding.projectName,
+            runId: compactRun.id,
+            command: 'compact_context',
+            jobRunSummary: this.codexSessionManager.getRunSummaryByJobId(job.id)
+          }
+        }, jobLogger);
+
+        this.refreshConversationSummary(conversation.id);
+
+        this.state.processedJobs += 1;
+        this.state.lastSuccessAt = nowIso();
+        this.jobAttempts.finishAttempt({
+          attemptId,
+          outcome: 'succeeded',
+          finishedAt: nowIso(),
+          openaiRequestId: codexCompletion?.codexSessionId ?? null,
+          feishuSendStatus: 'sent'
+        });
+        jobLogger.info('compact context command handled by codex', {
+          session_id: compactSession.id,
+          run_id: compactRun.id
+        });
+        this.writeHealth('running');
+        return true;
+      }
+
       const existingDelivery = this.deliveries.getByJobId(job.id);
       if (existingDelivery) {
         stage = 'delivery';
@@ -213,8 +378,36 @@ export class AssistantWorkerService {
           {}
         );
       } else {
-        const projectBinding =
-          this.ensureConversationProjectBinding(conversation);
+        const projectBinding = this.ensureConversationProjectBinding(conversation);
+        if ('errorReplyText' in projectBinding) {
+          await this.sendLocalReply({
+            conversationId: conversation.id,
+            chatId: conversation.chatId,
+            replyToMessageId: triggerMessage.platformMessageId,
+            jobId: job.id,
+            replyText: projectBinding.errorReplyText,
+            metadata: {
+              source: 'local_control_command',
+              command: 'project_guardrail',
+              reason: 'unrunnable_project'
+            }
+          }, jobLogger);
+
+          this.refreshConversationSummary(conversation.id);
+          this.state.processedJobs += 1;
+          this.state.lastSuccessAt = nowIso();
+          this.jobAttempts.finishAttempt({
+            attemptId,
+            outcome: 'succeeded',
+            finishedAt: nowIso(),
+            feishuSendStatus: 'sent'
+          });
+          jobLogger.info(
+            'job rejected locally because project binding is unrunnable'
+          );
+          this.writeHealth('running');
+          return true;
+        }
         const effectiveUserText = this.resolveCodexUserText(
           command,
           triggerMessage.contentText
@@ -484,8 +677,23 @@ export class AssistantWorkerService {
     id: number;
     currentProjectName: string | null;
     currentProjectPath: string | null;
-  }): { projectName: string; projectPath: string } {
+  }):
+    | { projectName: string; projectPath: string }
+    | { errorReplyText: string } {
     if (conversation.currentProjectName && conversation.currentProjectPath) {
+      const container = describeWorkspaceContainerProject(
+        conversation.currentProjectPath
+      );
+      if (container) {
+        this.conversations.clearProjectBinding(conversation.id, nowIso());
+        return {
+          errorReplyText: this.buildWorkspaceContainerReply(
+            container.name,
+            container.suggestions
+          )
+        };
+      }
+
       return {
         projectName: conversation.currentProjectName,
         projectPath: conversation.currentProjectPath
@@ -497,6 +705,23 @@ export class AssistantWorkerService {
       this.config.codex.workspaceRoot,
       fallbackProjectName
     );
+
+    if (!isRunnableProjectPath(fallbackProjectPath)) {
+      const container = describeWorkspaceContainerProject(fallbackProjectPath);
+      if (container) {
+        return {
+          errorReplyText: this.buildWorkspaceContainerReply(
+            container.name,
+            container.suggestions
+          )
+        };
+      }
+
+      return {
+        errorReplyText:
+          '当前会话还没有绑定可运行的项目，请先发送“切换项目 <name>”选择一个具体项目。'
+      };
+    }
 
     this.conversations.bindProject(conversation.id, {
       workspaceRoot: this.config.codex.workspaceRoot,
@@ -510,6 +735,19 @@ export class AssistantWorkerService {
       projectName: fallbackProjectName,
       projectPath: fallbackProjectPath
     };
+  }
+
+  private buildWorkspaceContainerReply(
+    projectName: string,
+    suggestions: Array<{ name: string }>
+  ): string {
+    if (suggestions.length === 0) {
+      return `不能切换到 ${projectName}：该目录更像工作区容器，不是具体项目。请改切到一个实际子项目。`;
+    }
+
+    return `不能切换到 ${projectName}：该目录更像工作区容器，不是具体项目。请改切到具体子项目，例如：${suggestions
+      .map((suggestion) => suggestion.name)
+      .join('、')}`;
   }
 
   private async sendLocalReply(
@@ -721,6 +959,20 @@ export class AssistantWorkerService {
     }
 
     if (command.type === 'switch_project') {
+      const inspection = inspectWorkspaceProject(
+        this.config.codex.workspaceRoot,
+        command.projectName
+      );
+      if (!inspection.ok && inspection.reason === 'workspace_container') {
+        return {
+          commandType: command.type,
+          replyText: this.buildWorkspaceContainerReply(
+            inspection.projectName,
+            inspection.suggestions ?? []
+          )
+        };
+      }
+
       const project = resolveWorkspaceProject(
         this.config.codex.workspaceRoot,
         command.projectName
@@ -1254,4 +1506,21 @@ function isHistoricalImageFailureReply(text: string): boolean {
     normalized.includes('附件状态仍像是 `400`') ||
     normalized.includes('文字消息通') && normalized.includes('图片附件当前不通')
   );
+}
+
+function normalizeCompactReplyText(text: string | null): string {
+  const normalized = text?.trim();
+  if (!normalized) {
+    return '已触发上下文压缩。Codex 未返回详细摘要，但当前会话可继续使用。';
+  }
+
+  const lower = normalized.toLowerCase();
+  if (
+    lower === 'codex execution completed.' ||
+    lower === 'codex execution completed'
+  ) {
+    return '已触发上下文压缩。Codex 未返回详细摘要，但当前会话可继续使用。';
+  }
+
+  return normalized;
 }

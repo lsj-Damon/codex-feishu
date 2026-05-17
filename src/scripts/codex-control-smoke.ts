@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { AssistantWorkerService } from '../apps/assistant-worker/service.js';
@@ -10,24 +10,45 @@ import { runMigrations } from '../core/db/migrations.js';
 import { HealthReporter } from '../core/health/reporter.js';
 import { AppLogger } from '../core/logger/logger.js';
 import { parseCodexControlCommand } from '../domains/codex/control-commands.js';
+import { FakeCodexCliClient } from '../domains/codex/fake-client.js';
+import { createProgressMessageEvent } from '../domains/codex/stream-publisher.js';
 
 async function main(): Promise<void> {
   const runtimeRoot = path.join(process.cwd(), '.runtime', 'codex-control-smoke');
-  rmSync(runtimeRoot, { recursive: true, force: true });
-  mkdirSync(runtimeRoot, { recursive: true });
+  resetRuntime(runtimeRoot);
 
   await testProjectCommands(runtimeRoot);
+  resetRuntime(runtimeRoot);
+  await testWorkspaceContainerGuardrail(runtimeRoot);
+  resetRuntime(runtimeRoot);
+  await testCompactContextCommand(runtimeRoot);
+  resetRuntime(runtimeRoot);
+  await testCompactContextFallback(runtimeRoot);
+  resetRuntime(runtimeRoot);
+  await testCompactContextGuardrail(runtimeRoot);
+  resetRuntime(runtimeRoot);
+  await testStaleContainerBindingIsCleared(runtimeRoot);
   console.log('Codex control-command smoke checks passed.');
+}
+
+function resetRuntime(runtimeRoot: string): void {
+  rmSync(runtimeRoot, { recursive: true, force: true });
+  mkdirSync(runtimeRoot, { recursive: true });
 }
 
 async function testProjectCommands(runtimeRoot: string): Promise<void> {
   const workspaceRoot = path.join(runtimeRoot, 'workspace');
   mkdirSync(path.join(workspaceRoot, 'alpha'), { recursive: true });
   mkdirSync(path.join(workspaceRoot, 'beta'), { recursive: true });
+  writeFileSync(path.join(workspaceRoot, 'alpha', 'package.json'), '{}');
+  writeFileSync(path.join(workspaceRoot, 'beta', 'package.json'), '{}');
 
   const config = createTestConfig(runtimeRoot, workspaceRoot);
   ensureRuntimeDirectories(config);
-  const logger = new AppLogger('codex-control-smoke', path.join(config.paths.logsDir, 'worker.log'));
+  const logger = new AppLogger(
+    'codex-control-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
   const database = openDatabase(config.paths.dbFile, logger);
   runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
 
@@ -62,7 +83,7 @@ async function testProjectCommands(runtimeRoot: string): Promise<void> {
     platformMessageId: 'msg-switch',
     text: '切换项目 alpha'
   });
-  assert.match(switchResult.replyText, /已切换项目到 alpha/);
+  assert.match(switchResult.replyText, /alpha/);
 
   const currentAfter = await runWorkerForMessage({
     database,
@@ -72,7 +93,7 @@ async function testProjectCommands(runtimeRoot: string): Promise<void> {
     platformMessageId: 'msg-current-after',
     text: '当前项目'
   });
-  assert.match(currentAfter.replyText, /当前项目：alpha/);
+  assert.match(currentAfter.replyText, /alpha/);
 
   const createResult = await runWorkerForMessage({
     database,
@@ -82,7 +103,7 @@ async function testProjectCommands(runtimeRoot: string): Promise<void> {
     platformMessageId: 'msg-create',
     text: '新建项目 gamma'
   });
-  assert.match(createResult.replyText, /已新建并切换到项目 gamma/);
+  assert.match(createResult.replyText, /gamma/);
 
   const updatedConversation = database.prepare(`
     SELECT current_project_name, current_project_path
@@ -98,8 +119,306 @@ async function testProjectCommands(runtimeRoot: string): Promise<void> {
     path.join(workspaceRoot, 'gamma')
   );
 
-  const analyze = parseCodexControlCommand('分析项目');
-  assert.equal(analyze.type, 'analyze_project');
+  assert.equal(parseCodexControlCommand('分析项目').type, 'analyze_project');
+  assert.equal(parseCodexControlCommand('压缩上下文').type, 'compact_context');
+
+  database.close();
+}
+
+async function testWorkspaceContainerGuardrail(
+  runtimeRoot: string
+): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace');
+  mkdirSync(path.join(workspaceRoot, 'ecu', '.npm-cache'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'analysis-reports'), {
+    recursive: true
+  });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'analysis-reports-r2'), {
+    recursive: true
+  });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'car-gateway'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'car-saas'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'docs'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'ecu-firmware'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'mobility'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'services'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'tools'), { recursive: true });
+  writeFileSync(path.join(workspaceRoot, 'ecu', 'findings.md'), '# findings');
+  writeFileSync(path.join(workspaceRoot, 'ecu', 'progress.md'), '# progress');
+  writeFileSync(path.join(workspaceRoot, 'ecu', 'task_plan.md'), '# plan');
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-control-container-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(database, workspaceRoot);
+  const result = await runWorkerForMessage({
+    database,
+    config,
+    logger,
+    conversationId,
+    platformMessageId: 'msg-switch-ecu',
+    text: '切换项目 ecu'
+  });
+
+  assert.match(result.replyText, /不能切换到 ecu/);
+  assert.match(result.replyText, /car-gateway/);
+  assert.match(result.replyText, /car-saas|ecu-firmware|mobility|services|tools/);
+
+  database.close();
+}
+
+async function testCompactContextCommand(runtimeRoot: string): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace-compact');
+  const projectPath = path.join(workspaceRoot, 'alpha');
+  mkdirSync(projectPath, { recursive: true });
+  writeFileSync(path.join(projectPath, 'package.json'), '{}');
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-control-compact-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(database, workspaceRoot);
+  bindActiveCompactSession(
+    database,
+    conversationId,
+    projectPath,
+    'thread-compact-test'
+  );
+
+  const fakeCodex = new FakeCodexCliClient([
+    {
+      sessionId: 'thread-compact-test',
+      events: [
+        { type: 'turn.started' },
+        createProgressMessageEvent('Compacting session context'),
+        {
+          type: 'item.completed',
+          item: {
+            type: 'agent_message',
+            text: 'Context compacted.'
+          }
+        }
+      ],
+      completion: {
+        exitCode: 0,
+        finalMessageText: 'Context compacted.',
+        jsonlPath: path.join(runtimeRoot, 'compact.jsonl'),
+        stderrPath: path.join(runtimeRoot, 'compact.stderr')
+      }
+    }
+  ]);
+
+  const result = await runWorkerForMessage({
+    database,
+    config,
+    logger,
+    conversationId,
+    platformMessageId: 'msg-compact',
+    text: '压缩上下文',
+    codexClient: fakeCodex
+  });
+
+  assert.equal(result.replyText, 'Context compacted.');
+  assert.equal(fakeCodex.resumeSessionInputs.length, 1);
+  assert.equal(fakeCodex.runNewSessionInputs.length, 0);
+  assert.equal(fakeCodex.resumeSessionInputs[0]?.promptText, '/compact');
+
+  database.close();
+}
+
+async function testCompactContextFallback(runtimeRoot: string): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace-compact-fallback');
+  const projectPath = path.join(workspaceRoot, 'alpha');
+  mkdirSync(projectPath, { recursive: true });
+  writeFileSync(path.join(projectPath, 'package.json'), '{}');
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-control-compact-fallback-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(database, workspaceRoot);
+  bindActiveCompactSession(
+    database,
+    conversationId,
+    projectPath,
+    'thread-compact-fallback'
+  );
+
+  const fakeCodex = new FakeCodexCliClient([
+    {
+      sessionId: 'thread-compact-fallback',
+      events: [
+        { type: 'turn.started' },
+        {
+          type: 'item.completed',
+          item: {
+            type: 'agent_message',
+            text: 'Codex execution completed.'
+          }
+        }
+      ],
+      completion: {
+        exitCode: 0,
+        finalMessageText: 'Codex execution completed.',
+        jsonlPath: path.join(runtimeRoot, 'compact-fallback.jsonl'),
+        stderrPath: path.join(runtimeRoot, 'compact-fallback.stderr')
+      }
+    }
+  ]);
+
+  const result = await runWorkerForMessage({
+    database,
+    config,
+    logger,
+    conversationId,
+    platformMessageId: 'msg-compact-fallback',
+    text: '压缩上下文',
+    codexClient: fakeCodex
+  });
+
+  assert.equal(
+    result.replyText,
+    '已触发上下文压缩。Codex 未返回详细摘要，但当前会话可继续使用。'
+  );
+
+  database.close();
+}
+
+async function testCompactContextGuardrail(runtimeRoot: string): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace-container');
+  const containerPath = path.join(workspaceRoot, 'ecu');
+  mkdirSync(path.join(containerPath, '.npm-cache'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'analysis-reports'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'analysis-reports-r2'), {
+    recursive: true
+  });
+  mkdirSync(path.join(containerPath, 'car-gateway'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'car-saas'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'docs'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'ecu-firmware'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'mobility'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'services'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'tools'), { recursive: true });
+  writeFileSync(path.join(containerPath, 'findings.md'), '# findings');
+  writeFileSync(path.join(containerPath, 'progress.md'), '# progress');
+  writeFileSync(path.join(containerPath, 'task_plan.md'), '# plan');
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-control-compact-guardrail-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(database, workspaceRoot);
+  bindActiveCompactSession(
+    database,
+    conversationId,
+    containerPath,
+    'thread-ecu'
+  );
+
+  const fakeCodex = new FakeCodexCliClient();
+  const result = await runWorkerForMessage({
+    database,
+    config,
+    logger,
+    conversationId,
+    platformMessageId: 'msg-compact-guardrail',
+    text: '压缩上下文',
+    codexClient: fakeCodex
+  });
+
+  assert.match(result.replyText, /不能切换到 ecu/);
+  assert.equal(fakeCodex.resumeSessionInputs.length, 0);
+  assert.equal(fakeCodex.runNewSessionInputs.length, 0);
+
+  database.close();
+}
+
+async function testStaleContainerBindingIsCleared(
+  runtimeRoot: string
+): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace-stale-container');
+  const containerPath = path.join(workspaceRoot, 'ecu');
+  mkdirSync(path.join(containerPath, '.npm-cache'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'analysis-reports'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'analysis-reports-r2'), {
+    recursive: true
+  });
+  mkdirSync(path.join(containerPath, 'car-gateway'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'car-saas'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'docs'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'ecu-firmware'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'mobility'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'services'), { recursive: true });
+  mkdirSync(path.join(containerPath, 'tools'), { recursive: true });
+  writeFileSync(path.join(containerPath, 'findings.md'), '# findings');
+  writeFileSync(path.join(containerPath, 'progress.md'), '# progress');
+  writeFileSync(path.join(containerPath, 'task_plan.md'), '# plan');
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-control-stale-container-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(database, workspaceRoot);
+  bindActiveCompactSession(
+    database,
+    conversationId,
+    containerPath,
+    'thread-stale-ecu'
+  );
+
+  const fakeCodex = new FakeCodexCliClient();
+  const result = await runWorkerForMessage({
+    database,
+    config,
+    logger,
+    conversationId,
+    platformMessageId: 'msg-stale-container',
+    text: '普通文本',
+    codexClient: fakeCodex
+  });
+
+  assert.match(result.replyText, /不能切换到 ecu/);
+  assert.equal(fakeCodex.resumeSessionInputs.length, 0);
+  assert.equal(fakeCodex.runNewSessionInputs.length, 0);
+
+  const binding = database.prepare(`
+    SELECT current_project_name, current_project_path, active_session_id
+    FROM conversations
+    WHERE id = ?
+  `).get(conversationId) as {
+    current_project_name: string | null;
+    current_project_path: string | null;
+    active_session_id: number | null;
+  };
+  assert.equal(binding.current_project_name, null);
+  assert.equal(binding.current_project_path, null);
+  assert.equal(binding.active_session_id, null);
 
   database.close();
 }
@@ -111,6 +430,7 @@ async function runWorkerForMessage(input: {
   conversationId: number;
   platformMessageId: string;
   text: string;
+  codexClient?: FakeCodexCliClient;
 }): Promise<{ replyText: string }> {
   const createdAt = nowIso();
   input.database.prepare(`
@@ -147,7 +467,8 @@ async function runWorkerForMessage(input: {
     input.logger,
     new FakeFeishuMessageClient() as any,
     new FakeOpenAiClient() as any,
-    new HealthReporter('worker', input.config.paths.healthFile)
+    new HealthReporter('worker', input.config.paths.healthFile),
+    input.codexClient
   );
   const processed = await worker.runSingleIteration();
   assert.equal(processed, true);
@@ -165,7 +486,10 @@ async function runWorkerForMessage(input: {
   };
 }
 
-function seedConversation(database: ReturnType<typeof openDatabase>, workspaceRoot: string): number {
+function seedConversation(
+  database: ReturnType<typeof openDatabase>,
+  workspaceRoot: string
+): number {
   const createdAt = nowIso();
   database.prepare(`
     INSERT INTO conversations (
@@ -175,8 +499,46 @@ function seedConversation(database: ReturnType<typeof openDatabase>, workspaceRo
   `).run(workspaceRoot, createdAt, createdAt, createdAt);
 
   return Number(
-    (database.prepare(`SELECT id FROM conversations WHERE conversation_key = 'chat-control'`).get() as { id: number }).id
+    (
+      database
+        .prepare(`SELECT id FROM conversations WHERE conversation_key = 'chat-control'`)
+        .get() as { id: number }
+    ).id
   );
+}
+
+function bindActiveCompactSession(
+  database: ReturnType<typeof openDatabase>,
+  conversationId: number,
+  projectPath: string,
+  codexSessionId: string
+): void {
+  const createdAt = nowIso();
+  database.prepare(`
+    UPDATE conversations
+    SET current_project_name = 'alpha',
+        current_project_path = ?,
+        active_backend = 'codex',
+        last_switch_at = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).run(projectPath, createdAt, createdAt, conversationId);
+  database.prepare(`
+    INSERT INTO codex_sessions (
+      conversation_id, project_name, project_path, codex_session_id, status,
+      created_at, last_active_at, archived_at
+    ) VALUES (?, 'alpha', ?, ?, 'active', ?, ?, NULL)
+  `).run(conversationId, projectPath, codexSessionId, createdAt, createdAt);
+  const sessionId = Number(
+    (database.prepare(`
+      SELECT id FROM codex_sessions WHERE conversation_id = ? ORDER BY id DESC LIMIT 1
+    `).get(conversationId) as { id: number }).id
+  );
+  database.prepare(`
+    UPDATE conversations
+    SET active_session_id = ?
+    WHERE id = ?
+  `).run(sessionId, conversationId);
 }
 
 function createTestConfig(runtimeRoot: string, workspaceRoot: string): AppConfig {
@@ -258,7 +620,10 @@ class FakeOpenAiClient {
 }
 
 class FakeFeishuMessageClient {
-  public async replyText(): Promise<{ platformMessageId: string; raw: Record<string, unknown> }> {
+  public async replyText(): Promise<{
+    platformMessageId: string;
+    raw: Record<string, unknown>;
+  }> {
     return {
       platformMessageId: `reply-${Date.now()}`,
       raw: {}
