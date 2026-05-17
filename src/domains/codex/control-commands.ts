@@ -18,16 +18,18 @@ export type CodexControlCommand =
 export interface WorkspaceProjectInfo {
   name: string;
   path: string;
+  displayName: string;
 }
 
 export type WorkspaceProjectInspection =
   | {
       ok: true;
       project: WorkspaceProjectInfo;
+      matchKind: 'direct' | 'nested_path' | 'unique_leaf';
     }
   | {
       ok: false;
-      reason: 'not_found' | 'unsafe_name' | 'workspace_container';
+      reason: 'not_found' | 'unsafe_name' | 'workspace_container' | 'ambiguous_name';
       projectName: string;
       suggestions?: WorkspaceProjectInfo[];
     };
@@ -107,9 +109,10 @@ export function listWorkspaceProjects(
     .filter((entry) => entry.isDirectory())
     .map((entry) => ({
       name: entry.name,
-      path: path.join(workspaceRoot, entry.name)
+      path: path.join(workspaceRoot, entry.name),
+      displayName: entry.name
     }))
-    .sort((a, b) => a.name.localeCompare(b.name, 'en'));
+    .sort((a, b) => a.displayName.localeCompare(b.displayName, 'en'));
 }
 
 export function resolveWorkspaceProject(
@@ -128,7 +131,8 @@ export function inspectWorkspaceProject(
   workspaceRoot: string,
   projectName: string
 ): WorkspaceProjectInspection {
-  if (!isSafeProjectName(projectName)) {
+  const normalizedProjectName = normalizeProjectName(projectName);
+  if (!normalizedProjectName || !isSafeProjectName(normalizedProjectName)) {
     return {
       ok: false,
       reason: 'unsafe_name',
@@ -136,51 +140,52 @@ export function inspectWorkspaceProject(
     };
   }
 
-  const projectPath = path.join(workspaceRoot, projectName);
-  if (!isFirstLevelProject(workspaceRoot, projectPath)) {
+  const directMatch = inspectDirectProject(workspaceRoot, normalizedProjectName);
+  if (directMatch) {
+    return directMatch;
+  }
+
+  const nestedPathMatch = inspectNestedProjectPath(
+    workspaceRoot,
+    normalizedProjectName
+  );
+  if (nestedPathMatch) {
+    return nestedPathMatch;
+  }
+
+  const leafMatches = findNestedLeafMatches(workspaceRoot, normalizedProjectName);
+  if (leafMatches.length === 1) {
+    const uniqueLeafMatch = leafMatches[0];
+    if (!uniqueLeafMatch) {
+      return {
+        ok: false,
+        reason: 'not_found',
+        projectName
+      };
+    }
+
     return {
-      ok: false,
-      reason: 'unsafe_name',
-      projectName
+      ok: true,
+      project: uniqueLeafMatch,
+      matchKind: 'unique_leaf'
     };
   }
 
-  let stats;
-  try {
-    stats = statSync(projectPath);
-  } catch {
+  if (leafMatches.length > 1) {
     return {
       ok: false,
-      reason: 'not_found',
-      projectName
-    };
-  }
-
-  if (!stats.isDirectory()) {
-    return {
-      ok: false,
-      reason: 'not_found',
-      projectName
-    };
-  }
-
-  const project: WorkspaceProjectInfo = {
-    name: projectName,
-    path: projectPath
-  };
-
-  if (isWorkspaceContainerProject(projectPath)) {
-    return {
-      ok: false,
-      reason: 'workspace_container',
+      reason: 'ambiguous_name',
       projectName,
-      suggestions: findChildProjectSuggestions(projectPath)
+      suggestions: leafMatches
+        .sort((a, b) => a.displayName.localeCompare(b.displayName, 'en'))
+        .slice(0, MAX_CONTAINER_SUGGESTIONS)
     };
   }
 
   return {
-    ok: true,
-    project
+    ok: false,
+    reason: 'not_found',
+    projectName
   };
 }
 
@@ -188,11 +193,12 @@ export function createWorkspaceProject(
   workspaceRoot: string,
   projectName: string
 ): WorkspaceProjectInfo | null {
-  if (!isSafeProjectName(projectName)) {
+  const normalizedProjectName = normalizeProjectName(projectName);
+  if (!normalizedProjectName || !isSafeProjectName(normalizedProjectName)) {
     return null;
   }
 
-  const projectPath = path.join(workspaceRoot, projectName);
+  const projectPath = path.join(workspaceRoot, normalizedProjectName);
   if (!isFirstLevelProject(workspaceRoot, projectPath)) {
     return null;
   }
@@ -203,8 +209,9 @@ export function createWorkspaceProject(
   }
 
   return {
-    name: projectName,
-    path: projectPath
+    name: normalizedProjectName,
+    path: projectPath,
+    displayName: normalizedProjectName
   };
 }
 
@@ -237,12 +244,184 @@ export function describeWorkspaceContainerProject(
   };
 }
 
+function inspectDirectProject(
+  workspaceRoot: string,
+  normalizedProjectName: string
+): WorkspaceProjectInspection | null {
+  const projectPath = path.join(workspaceRoot, normalizedProjectName);
+  if (!isFirstLevelProject(workspaceRoot, projectPath)) {
+    return null;
+  }
+
+  let stats;
+  try {
+    stats = statSync(projectPath);
+  } catch {
+    return null;
+  }
+
+  if (!stats.isDirectory()) {
+    return null;
+  }
+
+  if (isWorkspaceContainerProject(projectPath)) {
+    return {
+      ok: false,
+      reason: 'workspace_container',
+      projectName: normalizedProjectName,
+      suggestions: findChildProjectSuggestions(projectPath)
+    };
+  }
+
+  return {
+    ok: true,
+    project: {
+      name: normalizedProjectName,
+      path: projectPath,
+      displayName: normalizedProjectName
+    },
+    matchKind: 'direct'
+  };
+}
+
+function inspectNestedProjectPath(
+  workspaceRoot: string,
+  normalizedProjectName: string
+): WorkspaceProjectInspection | null {
+  if (!normalizedProjectName.includes('/')) {
+    return null;
+  }
+
+  const projectPath = path.join(
+    workspaceRoot,
+    ...normalizedProjectName.split('/')
+  );
+  if (!isSafeNestedProjectPath(workspaceRoot, projectPath)) {
+    return {
+      ok: false,
+      reason: 'unsafe_name',
+      projectName: normalizedProjectName
+    };
+  }
+
+  let stats;
+  try {
+    stats = statSync(projectPath);
+  } catch {
+    return {
+      ok: false,
+      reason: 'not_found',
+      projectName: normalizedProjectName
+    };
+  }
+
+  if (!stats.isDirectory()) {
+    return {
+      ok: false,
+      reason: 'not_found',
+      projectName: normalizedProjectName
+    };
+  }
+
+  if (isWorkspaceContainerProject(projectPath)) {
+    return {
+      ok: false,
+      reason: 'workspace_container',
+      projectName: normalizedProjectName,
+      suggestions: findChildProjectSuggestions(projectPath)
+    };
+  }
+
+  return {
+    ok: true,
+    project: {
+      name: path.basename(projectPath),
+      path: projectPath,
+      displayName: normalizedProjectName
+    },
+    matchKind: 'nested_path'
+  };
+}
+
+function findNestedLeafMatches(
+  workspaceRoot: string,
+  leafName: string
+): WorkspaceProjectInfo[] {
+  const results: WorkspaceProjectInfo[] = [];
+  const queue = listWorkspaceProjects(workspaceRoot).map((project) => project.path);
+
+  while (queue.length > 0) {
+    const currentPath = queue.shift();
+    if (!currentPath) {
+      continue;
+    }
+
+    const childNames = readdirSafe(currentPath);
+    for (const childName of childNames) {
+      const childPath = path.join(currentPath, childName);
+      let stats;
+      try {
+        stats = statSync(childPath);
+      } catch {
+        continue;
+      }
+
+      if (!stats.isDirectory()) {
+        continue;
+      }
+
+      if (childName.startsWith('.')) {
+        continue;
+      }
+
+      if (NON_PROJECT_DIRECTORY_NAMES.has(childName.toLowerCase())) {
+        continue;
+      }
+
+      if (childName === leafName && !isWorkspaceContainerProject(childPath)) {
+        results.push({
+          name: childName,
+          path: childPath,
+          displayName: toWorkspaceRelativeDisplayName(workspaceRoot, childPath)
+        });
+      }
+
+      if (isWorkspaceContainerProject(childPath)) {
+        queue.push(childPath);
+      }
+    }
+  }
+
+  return results;
+}
+
+function normalizeProjectName(projectName: string): string {
+  const trimmed = projectName.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  return trimmed.replaceAll('\\', '/');
+}
+
 function isSafeProjectName(projectName: string): boolean {
   if (!projectName) {
     return false;
   }
 
-  return !/[\\/]/u.test(projectName) && !projectName.includes('..');
+  return !projectName.includes('..');
+}
+
+function isSafeNestedProjectPath(
+  workspaceRoot: string,
+  projectPath: string
+): boolean {
+  const resolvedRoot = path.resolve(workspaceRoot);
+  const resolvedProject = path.resolve(projectPath);
+  return (
+    resolvedProject === resolvedRoot ||
+    resolvedProject.startsWith(resolvedRoot + path.sep)
+  );
 }
 
 function isFirstLevelProject(
@@ -280,6 +459,7 @@ function isWorkspaceContainerProject(projectPath: string): boolean {
 }
 
 function findChildProjectSuggestions(projectPath: string): WorkspaceProjectInfo[] {
+  const workspaceRoot = findWorkspaceRootForProject(projectPath);
   return findChildProjectCandidates(projectPath)
     .sort((a, b) => {
       const aProject = hasRealProjectMarkers(a.path) ? 1 : 0;
@@ -288,9 +468,15 @@ function findChildProjectSuggestions(projectPath: string): WorkspaceProjectInfo[
         return bProject - aProject;
       }
 
-      return a.name.localeCompare(b.name, 'en');
+      return a.displayName.localeCompare(b.displayName, 'en');
     })
-    .slice(0, MAX_CONTAINER_SUGGESTIONS);
+    .slice(0, MAX_CONTAINER_SUGGESTIONS)
+    .map((candidate) => ({
+      ...candidate,
+      displayName: workspaceRoot
+        ? toWorkspaceRelativeDisplayName(workspaceRoot, candidate.path)
+        : candidate.displayName
+    }));
 }
 
 function findChildProjectCandidates(projectPath: string): WorkspaceProjectInfo[] {
@@ -320,11 +506,30 @@ function findChildProjectCandidates(projectPath: string): WorkspaceProjectInfo[]
 
     results.push({
       name: childName,
-      path: childPath
+      path: childPath,
+      displayName: childName
     });
   }
 
   return results;
+}
+
+function findWorkspaceRootForProject(projectPath: string): string | null {
+  const parts = path.resolve(projectPath).split(path.sep);
+  if (parts.length < 2) {
+    return null;
+  }
+
+  return parts.slice(0, Math.max(parts.length - 2, 1)).join(path.sep);
+}
+
+function toWorkspaceRelativeDisplayName(
+  workspaceRoot: string,
+  projectPath: string
+): string {
+  return path
+    .relative(workspaceRoot, projectPath)
+    .replaceAll('\\', '/');
 }
 
 function isDirectChildDirectory(projectPath: string, entryName: string): boolean {

@@ -19,6 +19,8 @@ async function main(): Promise<void> {
 
   await testProjectCommands(runtimeRoot);
   resetRuntime(runtimeRoot);
+  await testNestedProjectSwitch(runtimeRoot);
+  resetRuntime(runtimeRoot);
   await testWorkspaceContainerGuardrail(runtimeRoot);
   resetRuntime(runtimeRoot);
   await testCompactContextCommand(runtimeRoot);
@@ -121,6 +123,69 @@ async function testProjectCommands(runtimeRoot: string): Promise<void> {
 
   assert.equal(parseCodexControlCommand('分析项目').type, 'analyze_project');
   assert.equal(parseCodexControlCommand('压缩上下文').type, 'compact_context');
+
+  database.close();
+}
+
+async function testNestedProjectSwitch(runtimeRoot: string): Promise<void> {
+  const workspaceRoot = path.join(runtimeRoot, 'workspace');
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'car-gateway'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'services'), { recursive: true });
+  mkdirSync(path.join(workspaceRoot, 'ecu', 'tools'), { recursive: true });
+  writeFileSync(path.join(workspaceRoot, 'ecu', 'findings.md'), '# findings');
+  writeFileSync(path.join(workspaceRoot, 'ecu', 'progress.md'), '# progress');
+  writeFileSync(path.join(workspaceRoot, 'ecu', 'task_plan.md'), '# plan');
+  writeFileSync(
+    path.join(workspaceRoot, 'ecu', 'car-gateway', 'package.json'),
+    '{}'
+  );
+
+  const config = createTestConfig(runtimeRoot, workspaceRoot);
+  ensureRuntimeDirectories(config);
+  const logger = new AppLogger(
+    'codex-control-nested-smoke',
+    path.join(config.paths.logsDir, 'worker.log')
+  );
+  const database = openDatabase(config.paths.dbFile, logger);
+  runMigrations(database, path.join(process.cwd(), 'migrations'), logger);
+
+  const conversationId = seedConversation(database, workspaceRoot);
+
+  const byLeafName = await runWorkerForMessage({
+    database,
+    config,
+    logger,
+    conversationId,
+    platformMessageId: 'msg-switch-leaf',
+    text: '切换项目 car-gateway'
+  });
+  assert.match(byLeafName.replyText, /car-gateway/);
+  assert.match(byLeafName.replyText, /ecu[\\/]+car-gateway|ecu\/car-gateway/);
+
+  const byNestedPath = await runWorkerForMessage({
+    database,
+    config,
+    logger,
+    conversationId,
+    platformMessageId: 'msg-switch-nested',
+    text: '切换项目 ecu/car-gateway'
+  });
+  assert.match(byNestedPath.replyText, /car-gateway/);
+  assert.match(byNestedPath.replyText, /ecu[\\/]+car-gateway|ecu\/car-gateway/);
+
+  const binding = database.prepare(`
+    SELECT current_project_name, current_project_path
+    FROM conversations
+    WHERE id = ?
+  `).get(conversationId) as {
+    current_project_name: string | null;
+    current_project_path: string | null;
+  };
+  assert.equal(binding.current_project_name, 'car-gateway');
+  assert.equal(
+    binding.current_project_path,
+    path.join(workspaceRoot, 'ecu', 'car-gateway')
+  );
 
   database.close();
 }
